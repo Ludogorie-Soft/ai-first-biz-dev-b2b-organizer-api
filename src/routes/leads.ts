@@ -1,0 +1,207 @@
+import { Router, Request, Response, NextFunction } from 'express'
+import multer from 'multer'
+import XLSX from 'xlsx'
+import { ZodError } from 'zod'
+import { supabaseAdmin } from '../config/supabase'
+import { authMiddleware } from '../middleware/auth'
+
+const router = Router()
+router.use(authMiddleware)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
+
+interface ColumnMap {
+  email: string | null
+  first_name: string | null
+  last_name: string | null
+  notes: string | null
+}
+
+/**
+ * @swagger
+ * /leads:
+ *   get:
+ *     summary: List leads (optionally filtered by target group)
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: query
+ *         name: target_group_id
+ *         schema: { type: string }
+ *         description: Filter by target group UUID
+ *     responses:
+ *       200:
+ *         description: Array of lead objects
+ */
+router.get('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page as string) || 1)
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string) || 50))
+    const from = (page - 1) * limit
+    let query = supabaseAdmin
+      .from('leads')
+      .select('*', { count: 'exact' })
+      .eq('company_id', req.user.company_id)
+      .order('created_at')
+      .range(from, from + limit - 1)
+    if (req.query.target_group_id) {
+      query = query.eq('target_group_id', req.query.target_group_id as string)
+    }
+    const { data, error, count } = await query
+    if (error) {
+      res.status(400).json({ error: error.message })
+      return
+    }
+    res.json({ data, total: count, page, limit })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /leads/import:
+ *   post:
+ *     summary: Import leads from Excel file
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [file, target_group_id]
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *               target_group_id:
+ *                 type: string
+ *                 description: UUID of the target group
+ *               column_map:
+ *                 type: string
+ *                 description: 'JSON string mapping field names to Excel column headers, e.g. {"email":"Email Address","first_name":"First Name","last_name":"Last Name","notes":"Notes"}'
+ *     responses:
+ *       201:
+ *         description: Leads imported successfully
+ *       400:
+ *         description: Validation error or invalid file
+ */
+router.post(
+  '/import',
+  upload.single('file'),
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { target_group_id, column_map: rawColMap } = req.body as {
+        target_group_id?: string
+        column_map?: string
+      }
+      if (!target_group_id) {
+        res.status(400).json({ error: 'target_group_id is required' })
+        return
+      }
+      if (!req.file) {
+        res.status(400).json({ error: 'Excel file is required' })
+        return
+      }
+
+      const ALLOWED_MIMETYPES = [
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+        'application/vnd.ms-excel', // .xls
+      ]
+      if (!ALLOWED_MIMETYPES.includes(req.file.mimetype)) {
+        res.status(400).json({ error: 'Only .xlsx and .xls files are accepted' })
+        return
+      }
+
+      // Verify group belongs to company
+      const { data: group, error: groupErr } = await supabaseAdmin
+        .from('target_groups')
+        .select('id')
+        .eq('id', target_group_id)
+        .eq('company_id', req.user.company_id)
+        .single()
+      if (groupErr || !group) {
+        res.status(404).json({ error: 'Target group not found' })
+        return
+      }
+
+      // Parse Excel
+      const workbook = XLSX.read(req.file.buffer, { type: 'buffer' })
+      const sheet = workbook.Sheets[workbook.SheetNames[0]]
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' })
+
+      if (rows.length === 0) {
+        res.status(400).json({ error: 'Excel file is empty' })
+        return
+      }
+
+      // Column mapping: explicit map or auto-detect
+      let colMap: ColumnMap = { email: null, first_name: null, last_name: null, notes: null }
+      const hasColMap = rawColMap && rawColMap.trim().startsWith('{')
+      if (hasColMap) {
+        try {
+          colMap = JSON.parse(rawColMap) as ColumnMap
+        } catch {
+          res.status(400).json({ error: 'column_map must be a valid JSON string, e.g. {"email":"Email Address"}' })
+          return
+        }
+      } else {
+        // Auto-detect by common column names (case-insensitive)
+        const headers = Object.keys(rows[0])
+        const find = (candidates: string[]): string | null =>
+          headers.find((h) => candidates.includes(h.toLowerCase().trim())) ?? null
+        colMap = {
+          email: find(['email', 'e-mail', 'email address']),
+          first_name: find(['first_name', 'first name', 'firstname', 'name']),
+          last_name: find(['last_name', 'last name', 'lastname', 'surname']),
+          notes: find(['notes', 'note', 'comments', 'comment']),
+        }
+      }
+
+      if (!colMap.email) {
+        res.status(400).json({ error: 'Could not map email column. Provide column_map.' })
+        return
+      }
+
+      const emailCol = colMap.email
+      const leads = rows
+        .map((row) => ({
+          company_id: req.user.company_id,
+          target_group_id,
+          email: String(row[emailCol] ?? '').trim().toLowerCase(),
+          first_name: colMap.first_name ? String(row[colMap.first_name] ?? '').trim() : null,
+          last_name: colMap.last_name ? String(row[colMap.last_name] ?? '').trim() : null,
+          notes: colMap.notes ? String(row[colMap.notes] ?? '').trim() || null : null,
+        }))
+        .filter((l) => l.email && l.email.includes('@'))
+
+      if (leads.length === 0) {
+        res.status(400).json({ error: 'No valid leads found in the file' })
+        return
+      }
+
+      // Upsert to avoid duplicates within the same target group.
+      // Note: requires unique constraint on (company_id, target_group_id, email).
+      // See supabase/migrations/003_leads_unique.sql for the constraint definition.
+      const { error: insertErr } = await supabaseAdmin
+        .from('leads')
+        .upsert(leads, { onConflict: 'company_id,target_group_id,email', ignoreDuplicates: true })
+        .select('id')
+      if (insertErr) {
+        res.status(400).json({ error: insertErr.message })
+        return
+      }
+
+      res.status(201).json({ imported: leads.length, message: `${leads.length} leads processed` })
+    } catch (err) {
+      if (err instanceof ZodError) {
+        res.status(400).json({ error: err.errors })
+        return
+      }
+      next(err)
+    }
+  }
+)
+
+export default router
