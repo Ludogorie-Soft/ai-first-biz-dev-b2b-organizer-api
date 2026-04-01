@@ -130,4 +130,47 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction): P
   }
 })
 
+/**
+ * @swagger
+ * /auth/refresh:
+ *   post:
+ *     summary: Refresh an expired access token
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [refresh_token]
+ *             properties:
+ *               refresh_token: { type: string }
+ *     responses:
+ *       200:
+ *         description: New access_token and refresh_token
+ *       401:
+ *         description: Invalid or expired refresh token
+ */
+router.post('/refresh', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { refresh_token } = z.object({ refresh_token: z.string().min(1) }).parse(req.body)
+    const { data, error } = await supabaseAdmin.auth.refreshSession({ refresh_token })
+    if (error || !data.session) {
+      res.status(401).json({ error: error?.message ?? 'Invalid refresh token' })
+      return
+    }
+    res.json({
+      access_token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      expires_in: data.session.expires_in,
+    })
+  } catch (err) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: err.errors })
+      return
+    }
+    next(err)
+  }
+})
+
 export default router

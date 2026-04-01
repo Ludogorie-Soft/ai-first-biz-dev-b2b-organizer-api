@@ -150,4 +150,110 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
   }
 })
 
+/**
+ * @swagger
+ * /campaigns/{id}:
+ *   get:
+ *     summary: Get a single campaign
+ *     tags: [Campaigns]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Campaign object
+ *       404:
+ *         description: Not found
+ */
+router.get('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid campaign ID' })
+    return
+  }
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('campaigns')
+      .select('*, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .single()
+    if (error || !data) {
+      res.status(404).json({ error: 'Campaign not found' })
+      return
+    }
+    res.json(data)
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /campaigns/{id}:
+ *   patch:
+ *     summary: Update campaign status or details
+ *     tags: [Campaigns]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [active, paused, completed]
+ *               name: { type: string }
+ *               description: { type: string }
+ *     responses:
+ *       200:
+ *         description: Updated campaign
+ *       404:
+ *         description: Campaign not found
+ */
+router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid campaign ID' })
+    return
+  }
+  try {
+    const schema = z
+      .object({
+        status: z.enum(['active', 'paused', 'completed']).optional(),
+        name: z.string().min(1).optional(),
+        description: z.string().optional(),
+      })
+      .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
+    const body = schema.parse(req.body)
+
+    const { data, error } = await supabaseAdmin
+      .from('campaigns')
+      .update(body)
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .select()
+      .single()
+    if (error || !data) {
+      res.status(404).json({ error: 'Campaign not found' })
+      return
+    }
+    res.json(data)
+  } catch (err) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: err.errors })
+      return
+    }
+    next(err)
+  }
+})
+
 export default router

@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import multer from 'multer'
 import XLSX from 'xlsx'
-import { ZodError } from 'zod'
+import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
 
@@ -56,6 +56,130 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
     next(err)
   }
 })
+
+/**
+ * @swagger
+ * /leads/{id}:
+ *   patch:
+ *     summary: Update a lead's status or notes
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [active, replied, unsubscribed, bounced, opted_out]
+ *               notes: { type: string }
+ *     responses:
+ *       200:
+ *         description: Updated lead
+ *       404:
+ *         description: Lead not found
+ */
+router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid lead ID' })
+    return
+  }
+  try {
+    const schema = z
+      .object({
+        status: z.enum(['active', 'replied', 'unsubscribed', 'bounced', 'opted_out']).optional(),
+        notes: z.string().optional(),
+      })
+      .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
+    const body = schema.parse(req.body)
+
+    const { data, error } = await supabaseAdmin
+      .from('leads')
+      .update(body)
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .select()
+      .single()
+    if (error || !data) {
+      res.status(404).json({ error: 'Lead not found' })
+      return
+    }
+    res.json(data)
+  } catch (err) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: err.errors })
+      return
+    }
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /leads/preview:
+ *   post:
+ *     summary: Parse an Excel file and return its column headers (for mapping UI)
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [file]
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Column headers and first 3 rows as preview
+ */
+router.post(
+  '/preview',
+  upload.single('file'),
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: 'Excel file is required' })
+        return
+      }
+      const ALLOWED_MIMETYPES = [
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.ms-excel',
+      ]
+      if (!ALLOWED_MIMETYPES.includes(req.file.mimetype)) {
+        res.status(400).json({ error: 'Only .xlsx and .xls files are accepted' })
+        return
+      }
+
+      const workbook = XLSX.read(req.file.buffer, { type: 'buffer' })
+      const sheet = workbook.Sheets[workbook.SheetNames[0]]
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' })
+
+      if (rows.length === 0) {
+        res.status(400).json({ error: 'Excel file is empty' })
+        return
+      }
+
+      res.json({
+        columns: Object.keys(rows[0]),
+        preview: rows.slice(0, 3),
+        total_rows: rows.length,
+      })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
 
 /**
  * @swagger
