@@ -35,7 +35,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
   try {
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .select('id, email, created_at')
+      .select('id, email, is_paused, warmup_started_at, created_at')
       .eq('company_id', req.user.company_id)
       .order('created_at')
     if (error) {
