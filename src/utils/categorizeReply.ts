@@ -73,7 +73,7 @@ const NEGATIVE: string[] = [
   'не ми пишете',
 ]
 
-const OOO: string[] = {
+const OOO: string[] = [
   // English
   'out of office',
   'on vacation',
@@ -98,7 +98,7 @@ const OOO: string[] = {
   'не съм в офиса',
   'командировка',
   'служебна командировка',
-}
+]
 
 function categorizeReply(body: string): ReplyCategory {
   const lower = (body || '').toLowerCase()
