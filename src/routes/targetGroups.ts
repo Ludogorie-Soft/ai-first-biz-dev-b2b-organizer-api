@@ -21,7 +21,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
   try {
     const { data, error } = await supabaseAdmin
       .from('target_groups')
-      .select('*')
+      .select('*, leads(count)')
       .eq('company_id', req.user.company_id)
       .order('created_at')
     if (error) {

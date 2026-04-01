@@ -294,4 +294,65 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
   }
 })
 
+/**
+ * @swagger
+ * /campaigns/{id}:
+ *   delete:
+ *     summary: Delete a paused or draft campaign
+ *     tags: [Campaigns]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       204:
+ *         description: Deleted
+ *       400:
+ *         description: Campaign must be paused or draft before deleting
+ *       404:
+ *         description: Not found
+ */
+router.delete('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid campaign ID' })
+    return
+  }
+  try {
+    // Fetch first to verify ownership and status
+    const { data: campaign, error: fetchErr } = await supabaseAdmin
+      .from('campaigns')
+      .select('id, status')
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .single()
+
+    if (fetchErr || !campaign) {
+      res.status(404).json({ error: 'Campaign not found' })
+      return
+    }
+
+    if (!['paused', 'draft'].includes(campaign.status)) {
+      res.status(400).json({ error: 'Only paused or draft campaigns can be deleted' })
+      return
+    }
+
+    const { error } = await supabaseAdmin
+      .from('campaigns')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+
+    if (error) {
+      res.status(400).json({ error: error.message })
+      return
+    }
+
+    res.status(204).send()
+  } catch (err) {
+    next(err)
+  }
+})
+
 export default router
