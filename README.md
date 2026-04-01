@@ -54,6 +54,7 @@ Run these in order in the Supabase SQL editor:
 supabase/migrations/001_initial_schema.sql
 supabase/migrations/002_campaign_mailboxes.sql
 supabase/migrations/003_leads_unique.sql
+supabase/migrations/004_mailbox_warmup.sql
 ```
 
 ### 4. Start development
@@ -74,16 +75,22 @@ Swagger docs: `http://localhost:3000/api/docs`
 | `SUPABASE_URL` | Always | Project URL from Supabase → Settings → Data API |
 | `SUPABASE_SERVICE_ROLE_KEY` | Always | Service role key (bypasses RLS — keep secret) |
 | `REDIS_URL` | Always | Upstash Redis URL starting with `rediss://` |
-| `AWS_ACCESS_KEY_ID` | Worker only | AWS IAM key with SES permissions |
-| `AWS_SECRET_ACCESS_KEY` | Worker only | AWS IAM secret |
-| `AWS_REGION` | Worker only | e.g. `us-east-1` |
+| `AWS_ACCESS_KEY_ID` | Worker only | AWS IAM key — create an IAM user with `AmazonSESFullAccess` |
+| `AWS_SECRET_ACCESS_KEY` | Worker only | AWS IAM secret — shown once at creation |
+| `AWS_REGION` | Worker only | SES region, e.g. `eu-west-1` |
 | `SES_FROM_EMAIL` | Worker only | Verified sender email in AWS SES |
+| `SES_WEBHOOK_SECRET` | Worker only | Random string to protect the bounce webhook URL |
 | `IMAP_ENCRYPTION_KEY` | Worker only | 64 hex characters (32 random bytes) |
 | `PORT` | Optional | Defaults to `3000` |
 
 Generate the encryption key:
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Generate the webhook secret:
+```bash
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
 ```
 
 ---
@@ -96,7 +103,8 @@ Full interactive docs at `/api/docs`. Summary:
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/auth/register` | Create a new company + admin user |
-| `POST` | `/api/auth/login` | Sign in, returns `access_token` |
+| `POST` | `/api/auth/login` | Sign in, returns `access_token` and `refresh_token` |
+| `POST` | `/api/auth/refresh` | Exchange a `refresh_token` for a new `access_token` |
 
 ### Company
 | Method | Path | Description | Role |
@@ -108,7 +116,7 @@ Full interactive docs at `/api/docs`. Summary:
 ### Mailboxes
 | Method | Path | Description | Role |
 |---|---|---|---|
-| `GET` | `/api/mailboxes` | List mailboxes | Any |
+| `GET` | `/api/mailboxes` | List mailboxes (IMAP config omitted) | Any |
 | `POST` | `/api/mailboxes` | Add a mailbox (IMAP config encrypted at rest) | Any |
 | `DELETE` | `/api/mailboxes/:id` | Remove a mailbox | Owner / Admin |
 
@@ -117,39 +125,55 @@ Full interactive docs at `/api/docs`. Summary:
 |---|---|---|
 | `GET` | `/api/target-groups` | List target groups |
 | `POST` | `/api/target-groups` | Create a target group |
+| `DELETE` | `/api/target-groups/:id` | Delete a target group (fails if linked to a campaign) |
 
 ### Leads
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/leads` | List leads (`?target_group_id=`, `?page=`, `?limit=`) |
+| `PATCH` | `/api/leads/:id` | Update lead status or notes |
+| `POST` | `/api/leads/preview` | Parse an Excel file and return its column headers |
 | `POST` | `/api/leads/import` | Import leads from `.xlsx` file |
 
 ### Sequences
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/sequences` | List sequences with steps |
+| `GET` | `/api/sequences` | List all sequences with steps |
 | `POST` | `/api/sequences` | Create a sequence |
-| `POST` | `/api/sequences/:id/steps` | Add a step to a sequence |
+| `GET` | `/api/sequences/:id` | Get a single sequence with steps |
+| `DELETE` | `/api/sequences/:id` | Delete a sequence and all its steps |
+| `POST` | `/api/sequences/:id/steps` | Add a step |
+| `PATCH` | `/api/sequences/:id/steps/:stepId` | Edit a step |
+| `DELETE` | `/api/sequences/:id/steps/:stepId` | Delete a step |
 
 ### Campaigns
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/campaigns` | List campaigns |
 | `POST` | `/api/campaigns` | Create campaign and start sending |
-| `GET` | `/api/campaigns/:id/stats` | Get campaign stats (sent / pending / replied) |
+| `GET` | `/api/campaigns/:id` | Get a single campaign |
+| `PATCH` | `/api/campaigns/:id` | Update status (`active`, `paused`, `completed`) or name |
+| `GET` | `/api/campaigns/:id/stats` | Get stats (sent / pending / replied + breakdown) |
+
+### Webhooks
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/webhooks/ses?token=SECRET` | Receives SES bounce and complaint notifications from SNS |
 
 ---
 
 ## How the Worker Works
 
 ### Email Sender
-Listens to the BullMQ `email-sending` queue. When `POST /api/campaigns` is called, one job is created per lead. For each job the worker:
+Listens to the BullMQ `email-sending` queue. When `POST /api/campaigns` is called, jobs are created per lead with scheduled delays. For each job the worker:
 
-1. Checks if the lead is still `active` — skips if `replied`, `unsubscribed`, etc.
-2. Merges `{{first_name}}`, `{{last_name}}`, `{{email}}`, `{{full_name}}` into the subject and body
-3. Sends the email via AWS SES
-4. Writes a row to `email_logs` with status `sent`
-5. If there is a next sequence step, schedules a delayed job (`delay_days × 24h`)
+1. Checks if the mailbox is paused — skips if true
+2. Checks today's send count against the daily limit — requeues for tomorrow if exceeded
+3. Checks if the lead is still `active` — skips if `replied`, `unsubscribed`, etc.
+4. Merges `{{first_name}}`, `{{last_name}}`, `{{email}}`, `{{full_name}}` into the subject and body
+5. Sends the email via AWS SES
+6. Writes a row to `email_logs` with status `sent`
+7. If there is a next sequence step, schedules it at a random time within working hours on the target day
 
 ### Reply Catcher
 Polls every 5 minutes. For each mailbox:
@@ -162,18 +186,42 @@ Polls every 5 minutes. For each mailbox:
 
 ---
 
+## Email Warmup & Deliverability
+
+To avoid the spam folder, emails are sent within a working window (09:00–17:00 UTC) with random 3–8 minute gaps between sends. Daily limits ramp up automatically per inbox:
+
+| Days since mailbox created | Daily limit |
+|---|---|
+| 0–6 | 8 emails/day |
+| 7–20 | 12 emails/day |
+| 21+ | 18 emails/day |
+| Hard cap (v1) | 25 emails/day |
+
+If a mailbox's hard bounce rate exceeds **5%** over the last 30 days, it is automatically paused and no further emails are sent from it. Bounces are detected via the SES webhook.
+
+### SES Webhook Setup (AWS)
+1. SNS → **Create topic** (Standard) → note the ARN
+2. SES → your verified identity → **Notifications** → assign the SNS topic for **Bounces** and **Complaints**
+3. Add `SES_WEBHOOK_SECRET` to your `.env`
+4. SNS → **Subscriptions** → HTTPS → URL: `https://your-api.com/webhooks/ses?token=YOUR_SECRET`
+5. The first request is a `SubscriptionConfirmation` — the handler auto-confirms it
+
+---
+
 ## Lead Import Format
 
-Upload an `.xlsx` file to `POST /api/leads/import`. The endpoint auto-detects columns by header name. Recognized headers (case-insensitive):
+Upload an `.xlsx` file to `POST /api/leads/import`. Use `POST /api/leads/preview` first to see the column headers, then pass a `column_map` if headers are non-standard.
 
-| Field | Recognized column names |
+Auto-detected column names (case-insensitive):
+
+| Field | Recognized headers |
 |---|---|
 | `email` | `email`, `e-mail`, `email address` |
 | `first_name` | `first_name`, `first name`, `firstname`, `name` |
 | `last_name` | `last_name`, `last name`, `lastname`, `surname` |
 | `notes` | `notes`, `note`, `comments`, `comment` |
 
-For non-standard headers, pass a `column_map` JSON string:
+For non-standard headers:
 ```json
 {"email": "Work Email", "first_name": "Given Name", "last_name": "Family Name"}
 ```
@@ -187,6 +235,7 @@ For non-standard headers, pass a `column_map` JSON string:
 | `001_initial_schema.sql` | All core tables, enums, RLS policies, helper function |
 | `002_campaign_mailboxes.sql` | Junction table linking campaigns to sender mailboxes |
 | `003_leads_unique.sql` | Unique constraint on leads (required for import upsert) |
+| `004_mailbox_warmup.sql` | Adds `warmup_started_at` and `is_paused` to mailboxes |
 
 RLS is enforced on all tables using `public.get_auth_company_id()` — a `SECURITY DEFINER` function that prevents infinite recursion when querying the `users` table from within a policy.
 
@@ -209,4 +258,4 @@ Build:
 npm run build   # outputs to dist/
 ```
 
-Both containers need the same `.env` values. The worker additionally needs the AWS and IMAP encryption keys.
+Both containers need the same `.env` values. The worker additionally requires the AWS keys, `SES_WEBHOOK_SECRET`, and `IMAP_ENCRYPTION_KEY`.

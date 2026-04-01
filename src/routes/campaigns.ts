@@ -4,6 +4,7 @@ import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
 import { emailQueue } from '../queues/emailQueue'
 import { EmailJobData } from '../types'
+import { getDailyLimit, computeScheduledTimes } from '../utils/warmup'
 
 const router = Router()
 router.use(authMiddleware)
@@ -114,6 +115,19 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
       .eq('status', 'active')
 
     if (leads && leads.length > 0) {
+      // Fetch mailbox warmup dates to compute per-mailbox daily limits
+      const { data: mailboxRows } = await supabaseAdmin
+        .from('mailboxes')
+        .select('id, warmup_started_at, is_paused')
+        .in('id', body.mailbox_ids)
+
+      const mailboxMap = new Map(
+        (mailboxRows ?? []).map((m: { id: string; warmup_started_at: string; is_paused: boolean }) => [
+          m.id,
+          { warmupStartedAt: new Date(m.warmup_started_at), isPaused: m.is_paused },
+        ])
+      )
+
       for (const sequenceId of body.sequence_ids) {
         const { data: firstStep } = await supabaseAdmin
           .from('sequence_steps')
@@ -125,17 +139,41 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
 
         if (!firstStep) continue
 
-        const jobs = leads.map((lead: { id: string }, idx: number) => ({
-          name: `send-${lead.id}-${sequenceId}-step1`,
-          data: {
-            campaignId: campaign.id as string,
-            sequenceId,
-            stepId: firstStep.id as string,
-            leadId: lead.id,
-            // Round-robin mailbox assignment
-            mailboxId: body.mailbox_ids[idx % body.mailbox_ids.length],
-          } satisfies EmailJobData,
-        }))
+        // Group leads by their assigned mailbox (round-robin)
+        const mailboxLeads = new Map<string, string[]>()
+        leads.forEach((lead: { id: string }, idx: number) => {
+          const mbId = body.mailbox_ids[idx % body.mailbox_ids.length]
+          if (!mailboxLeads.has(mbId)) mailboxLeads.set(mbId, [])
+          mailboxLeads.get(mbId)!.push(lead.id)
+        })
+
+        const jobs: Array<{ name: string; data: EmailJobData; opts: { delay: number } }> = []
+
+        for (const [mbId, mbLeads] of mailboxLeads) {
+          const mbInfo = mailboxMap.get(mbId)
+          if (mbInfo?.isPaused) {
+            console.warn(`[Campaign] Skipping paused mailbox ${mbId}`)
+            continue
+          }
+          const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null)
+          const scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
+
+          mbLeads.forEach((leadId, idx) => {
+            const delayMs = Math.max(0, scheduledTimes[idx].getTime() - Date.now())
+            jobs.push({
+              name: `send-${leadId}-${sequenceId}-step1`,
+              data: {
+                campaignId: campaign.id as string,
+                sequenceId,
+                stepId: firstStep.id as string,
+                leadId,
+                mailboxId: mbId,
+              } satisfies EmailJobData,
+              opts: { delay: delayMs },
+            })
+          })
+        }
+
         await emailQueue.addBulk(jobs)
       }
     }

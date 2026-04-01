@@ -16,6 +16,7 @@ import leadRoutes from './routes/leads'
 import sequenceRoutes from './routes/sequences'
 import campaignRoutes from './routes/campaigns'
 import dashboardRoutes from './routes/dashboard'
+import webhookRoutes from './routes/webhooks'
 
 const app: Application = express()
 
@@ -25,6 +26,8 @@ app.use(cors())
 app.use(morgan('dev'))
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+// SNS sends notifications as text/plain containing a JSON string
+app.use(express.text({ type: 'text/plain' }))
 
 // Swagger docs
 const swaggerSpec = swaggerJsdoc({
@@ -55,6 +58,7 @@ app.use('/api/leads', leadRoutes)
 app.use('/api/sequences', sequenceRoutes)
 app.use('/api/campaigns', campaignRoutes)
 app.use('/api/campaigns', dashboardRoutes)
+app.use('/webhooks/ses', webhookRoutes)
 
 // Health check
 app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok' }))

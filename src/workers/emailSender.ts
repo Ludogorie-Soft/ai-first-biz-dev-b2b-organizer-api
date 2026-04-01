@@ -7,6 +7,7 @@ import { decrypt } from '../utils/encrypt'
 import { mergeVars } from '../utils/mergeVars'
 import { emailQueue } from '../queues/emailQueue'
 import { EmailJobData } from '../types'
+import { getDailyLimit, delayMsForNextStep } from '../utils/warmup'
 
 function createEmailSenderWorker(): Worker<EmailJobData> {
   const worker = new Worker<EmailJobData>(
@@ -40,13 +41,45 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         .single()
       if (!step) throw new Error(`Step ${stepId} not found`)
 
-      // Fetch mailbox
+      // Fetch mailbox — also check pause status and warmup date
       const { data: mailbox } = await supabaseAdmin
         .from('mailboxes')
         .select('*')
         .eq('id', mailboxId)
         .single()
       if (!mailbox) throw new Error(`Mailbox ${mailboxId} not found`)
+
+      // Skip if mailbox was paused (e.g. by bounce rate threshold)
+      if ((mailbox as { is_paused: boolean }).is_paused) {
+        console.warn(`[Worker] Mailbox ${mailboxId} is paused — skipping job ${job.id}`)
+        return
+      }
+
+      // Runtime daily limit check — safety net in case scheduler miscounted
+      const todayStart = new Date()
+      todayStart.setUTCHours(0, 0, 0, 0)
+      const { count: sentToday } = await supabaseAdmin
+        .from('email_logs')
+        .select('id', { count: 'exact', head: true })
+        .eq('mailbox_id', mailboxId)
+        .eq('status', 'sent')
+        .gte('sent_at', todayStart.toISOString())
+
+      const dailyLimit = getDailyLimit(
+        (mailbox as { warmup_started_at: string }).warmup_started_at
+          ? new Date((mailbox as { warmup_started_at: string }).warmup_started_at)
+          : null
+      )
+      if ((sentToday ?? 0) >= dailyLimit) {
+        // Requeue for tomorrow at working hours start
+        const tomorrow = new Date()
+        tomorrow.setUTCDate(tomorrow.getUTCDate() + 1)
+        tomorrow.setUTCHours(9, 0, 0, 0)
+        const delay = tomorrow.getTime() - Date.now()
+        await emailQueue.add(job.name, job.data, { delay })
+        console.log(`[Worker] Mailbox ${mailboxId} hit daily limit (${dailyLimit}) — requeued for tomorrow`)
+        return
+      }
 
       // Merge template variables into subject and body
       const subject = mergeVars(
@@ -97,8 +130,9 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         .single()
 
       if (nextStep) {
-        const delayMs =
-          ((nextStep as { delay_days: number }).delay_days || 1) * 24 * 60 * 60 * 1000
+        const delayMs = delayMsForNextStep(
+          (nextStep as { delay_days: number }).delay_days || 1
+        )
         await emailQueue.add(
           `send-${leadId}-${sequenceId}-next`,
           {
