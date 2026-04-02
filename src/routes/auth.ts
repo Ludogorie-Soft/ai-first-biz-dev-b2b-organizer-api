@@ -1,6 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
+import { sesClient } from '../config/ses'
+import { SendEmailCommand } from '@aws-sdk/client-ses'
 
 const router = Router()
 
@@ -45,7 +47,7 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
     const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
       email: body.email,
       password: body.password,
-      email_confirm: true,
+      email_confirm: false,
     })
     if (authError) {
       res.status(400).json({ error: authError.message })
@@ -72,10 +74,80 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
       return
     }
 
-    res.status(201).json({ message: 'Registered successfully. Please sign in.' })
+    // Create verification token and send email
+    const { data: verification } = await supabaseAdmin
+      .from('email_verifications')
+      .insert({ user_id: authData.user.id })
+      .select('token')
+      .single()
+
+    if (verification) {
+      const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${verification.token}`
+      await sesClient.send(
+        new SendEmailCommand({
+          Source: process.env.SES_FROM_EMAIL!,
+          Destination: { ToAddresses: [body.email] },
+          Message: {
+            Subject: { Data: 'Verify your email', Charset: 'UTF-8' },
+            Body: {
+              Html: {
+                Charset: 'UTF-8',
+                Data: `
+                  <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px">
+                    <h2 style="color:#1e293b">Verify your email</h2>
+                    <p style="color:#475569">Click the button below to activate your account. The link expires in 24 hours.</p>
+                    <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#4f46e5;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">
+                      Verify email
+                    </a>
+                    <p style="margin-top:24px;color:#94a3b8;font-size:12px">If you didn't create an account, you can ignore this email.</p>
+                  </div>`,
+              },
+            },
+          },
+        })
+      ).catch((sesErr: Error) => {
+        console.error('[Auth] Failed to send verification email:', sesErr.message)
+      })
+    }
+
+    res.status(201).json({ message: 'Registered successfully. Please verify your email.' })
   } catch (err) {
     if (err instanceof ZodError) {
       res.status(400).json({ error: err.errors })
+      return
+    }
+    next(err)
+  }
+})
+
+router.post('/verify-email', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { token } = z.object({ token: z.string().uuid() }).parse(req.body)
+
+    const { data: verification, error } = await supabaseAdmin
+      .from('email_verifications')
+      .select('user_id, expires_at')
+      .eq('token', token)
+      .single()
+
+    if (error || !verification) {
+      res.status(400).json({ error: 'Invalid or expired verification link.' })
+      return
+    }
+
+    if (new Date(verification.expires_at) < new Date()) {
+      await supabaseAdmin.from('email_verifications').delete().eq('token', token)
+      res.status(400).json({ error: 'Verification link has expired. Please register again.' })
+      return
+    }
+
+    await supabaseAdmin.auth.admin.updateUserById(verification.user_id, { email_confirm: true })
+    await supabaseAdmin.from('email_verifications').delete().eq('token', token)
+
+    res.json({ message: 'Email verified. You can now sign in.' })
+  } catch (err) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: 'Invalid token.' })
       return
     }
     next(err)
