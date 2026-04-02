@@ -131,13 +131,15 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
       for (const sequenceId of body.sequence_ids) {
         const { data: firstStep } = await supabaseAdmin
           .from('sequence_steps')
-          .select('id')
+          .select('id, delay_days')
           .eq('sequence_id', sequenceId)
           .order('step_order')
           .limit(1)
           .single()
 
         if (!firstStep) continue
+
+        const sendImmediately = (firstStep as { delay_days: number }).delay_days === 0
 
         // Group leads by their assigned mailbox (round-robin)
         const mailboxLeads = new Map<string, string[]>()
@@ -155,8 +157,14 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
             console.warn(`[Campaign] Skipping paused mailbox ${mbId}`)
             continue
           }
-          const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null)
-          const scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
+
+          let scheduledTimes: Date[]
+          if (sendImmediately) {
+            scheduledTimes = mbLeads.map(() => new Date())
+          } else {
+            const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null)
+            scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
+          }
 
           mbLeads.forEach((leadId, idx) => {
             const delayMs = Math.max(0, scheduledTimes[idx].getTime() - Date.now())
