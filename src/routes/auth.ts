@@ -113,7 +113,7 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
     res.status(201).json({ message: 'Registered successfully. Please verify your email.' })
   } catch (err) {
     if (err instanceof ZodError) {
-      res.status(400).json({ error: err.errors })
+      res.status(400).json({ error: err.errors[0]?.message ?? 'Validation error' })
       return
     }
     next(err)
@@ -195,7 +195,7 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction): P
     })
   } catch (err) {
     if (err instanceof ZodError) {
-      res.status(400).json({ error: err.errors })
+      res.status(400).json({ error: err.errors[0]?.message ?? 'Validation error' })
       return
     }
     next(err)
@@ -238,7 +238,7 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction):
     })
   } catch (err) {
     if (err instanceof ZodError) {
-      res.status(400).json({ error: err.errors })
+      res.status(400).json({ error: err.errors[0]?.message ?? 'Validation error' })
       return
     }
     next(err)
