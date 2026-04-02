@@ -55,6 +55,9 @@ supabase/migrations/001_initial_schema.sql
 supabase/migrations/002_campaign_mailboxes.sql
 supabase/migrations/003_leads_unique.sql
 supabase/migrations/004_mailbox_warmup.sql
+supabase/migrations/005_email_verifications.sql
+supabase/migrations/006_org_management.sql
+supabase/migrations/007_simplify_org.sql
 ```
 
 ### 4. Start development
@@ -81,6 +84,7 @@ Swagger docs: `http://localhost:3000/api/docs`
 | `SES_FROM_EMAIL` | Worker only | Verified sender email in AWS SES |
 | `SES_WEBHOOK_SECRET` | Worker only | Random string to protect the bounce webhook URL |
 | `IMAP_ENCRYPTION_KEY` | Worker only | 64 hex characters (32 random bytes) |
+| `FRONTEND_URL` | Always | Base URL of the frontend app (for invitation emails), e.g. `http://localhost:3001` |
 | `PORT` | Optional | Defaults to `3000` |
 
 Generate the encryption key:
@@ -107,18 +111,28 @@ Full interactive docs at `/api/docs`. Summary:
 | `POST` | `/api/auth/refresh` | Exchange a `refresh_token` for a new `access_token` |
 
 ### Company
-| Method | Path | Description | Role |
-|---|---|---|---|
-| `GET` | `/api/company` | Get company profile | Any |
-| `PATCH` | `/api/company` | Update company profile | Owner / Admin |
-| `GET` | `/api/company/users` | List team members | Any |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/company` | Get company profile |
+| `PATCH` | `/api/company` | Update company profile |
+| `GET` | `/api/company/users` | List team members |
+
+### Organization Management
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/org/invitations` | List pending invitations |
+| `POST` | `/api/org/invitations` | Send an invitation email |
+| `DELETE` | `/api/org/invitations/:id` | Revoke a pending invitation |
+| `GET` | `/api/org/invitations/check?token=` | Check invitation validity (public) |
+| `POST` | `/api/org/accept-invite/register` | Accept invitation and register |
+| `DELETE` | `/api/org/members/:id` | Remove a team member |
 
 ### Mailboxes
-| Method | Path | Description | Role |
-|---|---|---|---|
-| `GET` | `/api/mailboxes` | List mailboxes (IMAP config omitted) | Any |
-| `POST` | `/api/mailboxes` | Add a mailbox (IMAP config encrypted at rest) | Any |
-| `DELETE` | `/api/mailboxes/:id` | Remove a mailbox | Owner / Admin |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/mailboxes` | List mailboxes (IMAP config omitted) |
+| `POST` | `/api/mailboxes` | Add a mailbox (IMAP config encrypted at rest) |
+| `DELETE` | `/api/mailboxes/:id` | Remove a mailbox |
 
 ### Target Groups
 | Method | Path | Description |
@@ -180,7 +194,11 @@ Polls every 5 minutes. For each mailbox:
 
 1. Connects via IMAP and reads unseen emails from the last 24 hours
 2. Matches the sender email against leads that were previously contacted
-3. Categorizes the reply body: `positive`, `negative`, `neutral`, or `out_of_office`
+3. Categorizes the reply body using keyword matching (supports English and Bulgarian):
+   - **Positive:** interest, yes, sure, schedule, when, интересувам се, да, добре, etc.
+   - **Negative:** not interested, no thanks, remove, не ме интересува, не благодаря, etc.
+   - **Out of office:** vacation, out of office, отсъствам, ваканция, etc.
+   - **Neutral:** fallback if no keywords match
 4. Updates `email_logs` with the category
 5. Sets the lead status to `replied` — which stops all future emails to that lead
 
@@ -236,8 +254,23 @@ For non-standard headers:
 | `002_campaign_mailboxes.sql` | Junction table linking campaigns to sender mailboxes |
 | `003_leads_unique.sql` | Unique constraint on leads (required for import upsert) |
 | `004_mailbox_warmup.sql` | Adds `warmup_started_at` and `is_paused` to mailboxes |
+| `005_email_verifications.sql` | Adds `is_verified` and `verification_code` for email verification |
+| `006_org_management.sql` | Creates `invitations` table for invite-only team management |
+| `007_simplify_org.sql` | Removes `join_requests` and `audit_logs` (simplified org model) |
 
 RLS is enforced on all tables using `public.get_auth_company_id()` — a `SECURITY DEFINER` function that prevents infinite recursion when querying the `users` table from within a policy.
+
+---
+
+## Organization Management
+
+The platform uses an **invite** model:
+
+- All team members have **owner-level** access (no role hierarchy)
+- New members join by accepting email invitations
+- Invitations expire after 24 hours
+- When accepting an invitation, users register directly (no need for existing account)
+- Members can be removed by any team member
 
 ---
 

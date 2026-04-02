@@ -6,6 +6,37 @@ import { SendEmailCommand } from '@aws-sdk/client-ses'
 
 const router = Router()
 
+async function sendVerificationEmail(userId: string, email: string): Promise<void> {
+  const { data: verification } = await supabaseAdmin
+    .from('email_verifications')
+    .insert({ user_id: userId })
+    .select('token')
+    .single()
+  if (!verification) return
+  const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${verification.token}`
+  await sesClient.send(new SendEmailCommand({
+    Source: process.env.SES_FROM_EMAIL!,
+    Destination: { ToAddresses: [email] },
+    Message: {
+      Subject: { Data: 'Verify your email', Charset: 'UTF-8' },
+      Body: {
+        Html: {
+          Charset: 'UTF-8',
+          Data: `
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px">
+              <h2 style="color:#1e293b">Verify your email</h2>
+              <p style="color:#475569">Click the button below to activate your account. The link expires in 24 hours.</p>
+              <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#4f46e5;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">
+                Verify email
+              </a>
+              <p style="margin-top:24px;color:#94a3b8;font-size:12px">If you didn't create an account, you can ignore this email.</p>
+            </div>`,
+        },
+      },
+    },
+  })).catch((e: Error) => console.error('[Auth] Failed to send verification email:', e.message))
+}
+
 const registerSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8),
@@ -74,41 +105,7 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
       return
     }
 
-    // Create verification token and send email
-    const { data: verification } = await supabaseAdmin
-      .from('email_verifications')
-      .insert({ user_id: authData.user.id })
-      .select('token')
-      .single()
-
-    if (verification) {
-      const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${verification.token}`
-      await sesClient.send(
-        new SendEmailCommand({
-          Source: process.env.SES_FROM_EMAIL!,
-          Destination: { ToAddresses: [body.email] },
-          Message: {
-            Subject: { Data: 'Verify your email', Charset: 'UTF-8' },
-            Body: {
-              Html: {
-                Charset: 'UTF-8',
-                Data: `
-                  <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px">
-                    <h2 style="color:#1e293b">Verify your email</h2>
-                    <p style="color:#475569">Click the button below to activate your account. The link expires in 24 hours.</p>
-                    <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#4f46e5;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">
-                      Verify email
-                    </a>
-                    <p style="margin-top:24px;color:#94a3b8;font-size:12px">If you didn't create an account, you can ignore this email.</p>
-                  </div>`,
-              },
-            },
-          },
-        })
-      ).catch((sesErr: Error) => {
-        console.error('[Auth] Failed to send verification email:', sesErr.message)
-      })
-    }
+    await sendVerificationEmail(authData.user.id, body.email)
 
     res.status(201).json({ message: 'Registered successfully. Please verify your email.' })
   } catch (err) {

@@ -17,6 +17,7 @@ import sequenceRoutes from './routes/sequences'
 import campaignRoutes from './routes/campaigns'
 import dashboardRoutes from './routes/dashboard'
 import webhookRoutes from './routes/webhooks'
+import orgRoutes from './routes/org'
 
 const app: Application = express()
 
@@ -58,6 +59,7 @@ app.use('/api/leads', leadRoutes)
 app.use('/api/sequences', sequenceRoutes)
 app.use('/api/campaigns', campaignRoutes)
 app.use('/api/campaigns', dashboardRoutes)
+app.use('/api/org', orgRoutes)
 app.use('/webhooks/ses', webhookRoutes)
 
 // Health check
