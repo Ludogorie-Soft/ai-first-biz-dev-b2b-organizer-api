@@ -35,7 +35,7 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
 
     // Fetch emails received in the last 24 hours that are unseen
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
-    const messages = client.fetch({ since, seen: false }, { source: true, envelope: true })
+    const messages = client.fetch({ since }, { source: true, envelope: true })
 
     for await (const msg of messages) {
       try {
@@ -43,6 +43,11 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
         const parsed: ParsedMail = await simpleParser(msg.source)
         const senderEmail = parsed.from?.value?.[0]?.address?.toLowerCase()
         if (!senderEmail) continue
+
+        // Skip emails sent from the mailbox itself
+        if (senderEmail === mailbox.email.toLowerCase()) continue
+
+        console.log(`[ReplyCatcher] Checking email from: ${senderEmail}`)
 
         // Find leads in this company matching the sender email
         const { data: matchingLeads } = await supabaseAdmin
@@ -67,11 +72,12 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
         if (!logs || logs.length === 0) continue
 
         const replyText: string =
-          typeof parsed.text === 'string'
-            ? parsed.text
+          typeof parsed.text === 'string' && parsed.text.trim()
+            ? parsed.text.trim()
             : typeof parsed.html === 'string'
-            ? parsed.html
+            ? parsed.html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
             : ''
+        console.log(`[ReplyCatcher] Raw text for ${senderEmail}: "${replyText.slice(0, 200)}"`)
         const category = categorizeReply(replyText)
 
         for (const log of logs as { id: string; lead_id: string }[]) {
