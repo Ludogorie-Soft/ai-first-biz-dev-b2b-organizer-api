@@ -12,6 +12,8 @@ export interface Lead {
   email: string
   first_name: string | null
   last_name: string | null
+  company_name: string | null
+  position: string | null
   status: 'active' | 'replied' | 'unsubscribed' | 'bounced' | 'opted_out'
   notes: string | null
   created_at: string

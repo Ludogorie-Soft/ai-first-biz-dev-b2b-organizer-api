@@ -47,8 +47,6 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
         // Skip emails sent from the mailbox itself
         if (senderEmail === mailbox.email.toLowerCase()) continue
 
-        console.log(`[ReplyCatcher] Checking email from: ${senderEmail}`)
-
         // Find leads in this company matching the sender email
         const { data: matchingLeads } = await supabaseAdmin
           .from('leads')
@@ -77,7 +75,6 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
             : typeof parsed.html === 'string'
             ? parsed.html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
             : ''
-        console.log(`[ReplyCatcher] Raw text for ${senderEmail}: "${replyText.slice(0, 200)}"`)
         const category = categorizeReply(replyText)
 
         for (const log of logs as { id: string; lead_id: string }[]) {

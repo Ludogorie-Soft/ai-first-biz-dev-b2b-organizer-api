@@ -13,8 +13,62 @@ interface ColumnMap {
   email: string | null
   first_name: string | null
   last_name: string | null
+  company_name: string | null
+  position: string | null
   notes: string | null
 }
+
+/**
+ * @swagger
+ * /leads/template:
+ *   get:
+ *     summary: Download an Excel template with sample data for lead import
+ *     tags: [Leads]
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200:
+ *         description: Excel file (.xlsx)
+ */
+router.get('/template', (_req: Request, res: Response, next: NextFunction): void => {
+  try {
+    const sample = [
+      {
+        'First Name': 'John',
+        'Last Name': 'Doe',
+        'Job Title': 'CEO',
+        'Email': 'john.doe@acme.com',
+        'Linkedin URL': 'https://linkedin.com/in/johndoe',
+        'Facebook URL': 'https://facebook.com/johndoe',
+        'Company': 'Acme Corp',
+        'Website': 'https://acme.com',
+        'Office Email': 'office@acme.com',
+        'Telephone': '+1 555 000 0000',
+        'Company Linkedin': 'https://linkedin.com/company/acme',
+        'Size': '51-200',
+        'Industry': 'Software',
+        'Location': 'Sofia, Bulgaria',
+      },
+    ]
+    const ws = XLSX.utils.json_to_sheet(sample)
+
+    // Bold headers + fit column width to header text
+    const headers = Object.keys(sample[0])
+    headers.forEach((header, i) => {
+      const cellRef = XLSX.utils.encode_cell({ r: 0, c: i })
+      if (ws[cellRef]) ws[cellRef].s = { font: { bold: true } }
+    })
+    ws['!cols'] = headers.map((h) => ({ wch: h.length + 4 }))
+
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, 'Leads')
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx', cellStyles: true })
+    res.setHeader('Content-Disposition', 'attachment; filename="leads_template.xlsx"')
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.send(buffer)
+  } catch (err) {
+    next(err)
+  }
+})
 
 /**
  * @swagger
@@ -261,7 +315,7 @@ router.post(
       }
 
       // Column mapping: explicit map or auto-detect
-      let colMap: ColumnMap = { email: null, first_name: null, last_name: null, notes: null }
+      let colMap: ColumnMap = { email: null, first_name: null, last_name: null, company_name: null, position: null, notes: null }
       const hasColMap = rawColMap && rawColMap.trim().startsWith('{')
       if (hasColMap) {
         try {
@@ -279,6 +333,8 @@ router.post(
           email: find(['email', 'e-mail', 'email address']),
           first_name: find(['first_name', 'first name', 'firstname', 'name']),
           last_name: find(['last_name', 'last name', 'lastname', 'surname']),
+          company_name: find(['company_name', 'company name', 'company', 'organization', 'organisation']),
+          position: find(['position', 'job title', 'title', 'role', 'job_title']),
           notes: find(['notes', 'note', 'comments', 'comment']),
         }
       }
@@ -294,8 +350,10 @@ router.post(
           company_id: req.user.company_id,
           target_group_id,
           email: String(row[emailCol] ?? '').trim().toLowerCase(),
-          first_name: colMap.first_name ? String(row[colMap.first_name] ?? '').trim() : null,
-          last_name: colMap.last_name ? String(row[colMap.last_name] ?? '').trim() : null,
+          first_name: colMap.first_name ? String(row[colMap.first_name] ?? '').trim() || null : null,
+          last_name: colMap.last_name ? String(row[colMap.last_name] ?? '').trim() || null : null,
+          company_name: colMap.company_name ? String(row[colMap.company_name] ?? '').trim() || null : null,
+          position: colMap.position ? String(row[colMap.position] ?? '').trim() || null : null,
           notes: colMap.notes ? String(row[colMap.notes] ?? '').trim() || null : null,
         }))
         .filter((l) => l.email && l.email.includes('@'))

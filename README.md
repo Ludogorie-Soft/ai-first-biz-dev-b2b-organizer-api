@@ -292,3 +292,29 @@ npm run build   # outputs to dist/
 ```
 
 Both containers need the same `.env` values. The worker additionally requires the AWS keys, `SES_WEBHOOK_SECRET`, and `IMAP_ENCRYPTION_KEY`.
+
+---
+
+## Docker — Multi-platform Build & Push to Docker Hub
+
+Required for cross-OS compatibility (e.g. building on Mac M-series and deploying on Linux servers).
+Builds for both `linux/amd64` (Intel/Windows/Linux servers) and `linux/arm64` (Mac M1/M2/M3, AWS Graviton).
+
+**One-time setup — create the multi-platform builder:**
+
+```bash
+docker buildx create --name multibuilder --driver docker-container --use
+```
+
+**Build and push to Docker Hub:**
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t name/b2b-organizer-api:latest \
+  --push \
+  ./ai-first-biz-dev-b2b-organizer-api
+```
+
+> Run `docker login` first if not already authenticated.
+> The `--push` flag builds and pushes directly to Docker Hub in one step — no separate `docker push` needed.

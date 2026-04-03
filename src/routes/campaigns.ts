@@ -24,7 +24,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
   try {
     const { data, error } = await supabaseAdmin
       .from('campaigns')
-      .select('*, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
+      .select('*, target_group:target_groups(name), campaign_sequences(sequence_id, sequence:sequences(name)), campaign_mailboxes(mailbox_id)')
       .eq('company_id', req.user.company_id)
       .order('created_at', { ascending: false })
     if (error) {

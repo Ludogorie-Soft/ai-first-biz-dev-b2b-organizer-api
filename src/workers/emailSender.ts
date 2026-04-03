@@ -84,11 +84,11 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
       // Merge template variables into subject and body
       const subject = mergeVars(
         (step as { subject: string }).subject,
-        lead as { first_name: string | null; last_name: string | null; email: string }
+        lead as { first_name: string | null; last_name: string | null; email: string; company_name: string | null; position: string | null }
       )
       const body = mergeVars(
         (step as { body: string }).body,
-        lead as { first_name: string | null; last_name: string | null; email: string }
+        lead as { first_name: string | null; last_name: string | null; email: string; company_name: string | null; position: string | null }
       )
 
       // Use SES_FROM_EMAIL env var if set, otherwise fall back to mailbox email
