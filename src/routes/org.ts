@@ -176,6 +176,10 @@ router.post('/accept-invite/register', async (req: Request, res: Response, next:
 
     console.log('[AcceptInvite] Created user profile for company:', inv.company_id)
 
+    await supabaseAdmin
+      .from('user_companies')
+      .insert({ user_id: authData.user.id, company_id: inv.company_id })
+
     // Only delete the invitation after successful registration
     await supabaseAdmin.from('invitations').delete().eq('id', inv.id)
 
@@ -184,6 +188,7 @@ router.post('/accept-invite/register', async (req: Request, res: Response, next:
       access_token: session?.session?.access_token,
       refresh_token: session?.session?.refresh_token,
       user: { id: authData.user.id, email: inv.email },
+      company_id: inv.company_id,
     })
   } catch (err) {
     if (err instanceof ZodError) { res.status(400).json({ error: err.errors[0]?.message }); return }

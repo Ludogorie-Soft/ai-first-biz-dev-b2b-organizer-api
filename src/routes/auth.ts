@@ -105,6 +105,10 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
       return
     }
 
+    await supabaseAdmin
+      .from('user_companies')
+      .insert({ user_id: authData.user.id, company_id: company.id })
+
     await sendVerificationEmail(authData.user.id, body.email)
 
     res.status(201).json({ message: 'Registered successfully. Please verify your email.' })

@@ -91,13 +91,13 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         lead as { first_name: string | null; last_name: string | null; email: string; company_name: string | null; position: string | null }
       )
 
-      // Use SES_FROM_EMAIL env var if set, otherwise fall back to mailbox email
-      const fromEmail = process.env.SES_FROM_EMAIL || (mailbox as { email: string }).email
+      const mailboxEmail = (mailbox as { email: string }).email
 
-      // Send via AWS SES
+      // Send via AWS SES — always from the mailbox email (must be SES-verified)
       await sesClient.send(
         new SendEmailCommand({
-          Source: fromEmail,
+          Source: mailboxEmail,
+          ReplyToAddresses: [mailboxEmail],
           Destination: { ToAddresses: [(lead as { email: string }).email] },
           Message: {
             Subject: { Data: subject, Charset: 'UTF-8' },

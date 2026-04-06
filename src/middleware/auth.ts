@@ -28,10 +28,28 @@ async function authMiddleware(req: Request, res: Response, next: NextFunction): 
     return
   }
 
+  let companyId = profile.company_id as string
+
+  // If client requests a specific company, validate membership
+  const requestedCompanyId = req.headers['x-company-id'] as string | undefined
+  if (requestedCompanyId && requestedCompanyId !== companyId) {
+    const { data: membership } = await supabaseAdmin
+      .from('user_companies')
+      .select('company_id')
+      .eq('user_id', user.id)
+      .eq('company_id', requestedCompanyId)
+      .single()
+    if (!membership) {
+      res.status(403).json({ error: 'Access to this company is not allowed' })
+      return
+    }
+    companyId = requestedCompanyId
+  }
+
   req.user = {
     id: user.id,
     email: user.email ?? '',
-    company_id: profile.company_id as string,
+    company_id: companyId,
     role: profile.role as 'owner' | 'admin' | 'member',
   }
   next()
