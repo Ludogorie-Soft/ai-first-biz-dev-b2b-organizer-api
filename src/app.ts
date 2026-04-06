@@ -22,6 +22,10 @@ import companiesRoutes from './routes/companies'
 
 const app: Application = express()
 
+// Disable ETag generation — all API responses are user-specific so browser
+// caching via If-None-Match / 304 would serve stale data across sessions.
+app.set('etag', false)
+
 // Security & parsing middleware
 app.use(helmet())
 app.use(cors())

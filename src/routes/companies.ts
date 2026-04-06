@@ -19,17 +19,37 @@ router.use(authMiddleware)
  */
 router.get('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { data, error } = await supabaseAdmin
+    // Step 1: get all company_ids this user belongs to
+    const { data: memberships, error: membershipError } = await supabaseAdmin
       .from('user_companies')
-      .select('company:companies(id, name, website, industry)')
+      .select('company_id')
       .eq('user_id', req.user.id)
       .order('created_at')
-    if (error) {
-      res.status(400).json({ error: error.message })
+
+    if (membershipError) {
+      res.status(400).json({ error: membershipError.message })
       return
     }
-    const companies = (data ?? []).map((row: { company: unknown }) => row.company).filter(Boolean)
-    res.json(companies)
+
+    const companyIds = (memberships ?? []).map((m: { company_id: string }) => m.company_id)
+
+    if (companyIds.length === 0) {
+      res.json([])
+      return
+    }
+
+    // Step 2: fetch company details by IDs
+    const { data: companies, error: companiesError } = await supabaseAdmin
+      .from('companies')
+      .select('id, name')
+      .in('id', companyIds)
+
+    if (companiesError) {
+      res.status(400).json({ error: companiesError.message })
+      return
+    }
+
+    res.json(companies ?? [])
   } catch (err) {
     next(err)
   }

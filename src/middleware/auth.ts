@@ -33,17 +33,20 @@ async function authMiddleware(req: Request, res: Response, next: NextFunction): 
   // If client requests a specific company, validate membership
   const requestedCompanyId = req.headers['x-company-id'] as string | undefined
   if (requestedCompanyId && requestedCompanyId !== companyId) {
-    const { data: membership } = await supabaseAdmin
-      .from('user_companies')
-      .select('company_id')
-      .eq('user_id', user.id)
-      .eq('company_id', requestedCompanyId)
-      .single()
-    if (!membership) {
-      res.status(403).json({ error: 'Access to this company is not allowed' })
-      return
+    try {
+      const { data: membership } = await supabaseAdmin
+        .from('user_companies')
+        .select('company_id')
+        .eq('user_id', user.id)
+        .eq('company_id', requestedCompanyId)
+        .single()
+      if (membership) {
+        companyId = requestedCompanyId
+      }
+      // If no membership found, silently fall back to default company
+    } catch {
+      // user_companies table may not exist yet — fall back to default
     }
-    companyId = requestedCompanyId
   }
 
   req.user = {
