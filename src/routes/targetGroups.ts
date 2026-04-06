@@ -21,11 +21,51 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
   try {
     const { data, error } = await supabaseAdmin
       .from('target_groups')
-      .select('*, leads(count)')
+      .select('*, campaigns(count)')
       .eq('company_id', req.user.company_id)
       .order('created_at')
     if (error) {
       res.status(400).json({ error: error.message })
+      return
+    }
+    res.json(data)
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /target-groups/{id}:
+ *   get:
+ *     summary: Get a single target group
+ *     tags: [Target Groups]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Target group object
+ *       404:
+ *         description: Not found
+ */
+router.get('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid target group ID' })
+    return
+  }
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('target_groups')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .single()
+    if (error || !data) {
+      res.status(404).json({ error: 'Target group not found' })
       return
     }
     res.json(data)

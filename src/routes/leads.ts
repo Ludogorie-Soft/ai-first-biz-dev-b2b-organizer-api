@@ -4,6 +4,9 @@ import XLSX from 'xlsx'
 import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
+import { emailQueue } from '../queues/emailQueue'
+import { EmailJobData } from '../types'
+import { getDailyLimit, computeScheduledTimes } from '../utils/warmup'
 
 const router = Router()
 router.use(authMiddleware)
@@ -74,14 +77,14 @@ router.get('/template', (_req: Request, res: Response, next: NextFunction): void
  * @swagger
  * /leads:
  *   get:
- *     summary: List leads (optionally filtered by target group)
+ *     summary: List leads (optionally filtered by campaign)
  *     tags: [Leads]
  *     security: [{ bearerAuth: [] }]
  *     parameters:
  *       - in: query
- *         name: target_group_id
+ *         name: campaign_id
  *         schema: { type: string }
- *         description: Filter by target group UUID
+ *         description: Filter by campaign UUID
  *     responses:
  *       200:
  *         description: Array of lead objects
@@ -97,8 +100,8 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
       .eq('company_id', req.user.company_id)
       .order('created_at')
       .range(from, from + limit - 1)
-    if (req.query.target_group_id) {
-      query = query.eq('target_group_id', req.query.target_group_id as string)
+    if (req.query.campaign_id) {
+      query = query.eq('campaign_id', req.query.campaign_id as string)
     }
     const { data, error, count } = await query
     if (error) {
@@ -239,7 +242,7 @@ router.post(
  * @swagger
  * /leads/import:
  *   post:
- *     summary: Import leads from Excel file
+ *     summary: Import leads from Excel file into a campaign
  *     tags: [Leads]
  *     security: [{ bearerAuth: [] }]
  *     requestBody:
@@ -248,14 +251,14 @@ router.post(
  *         multipart/form-data:
  *           schema:
  *             type: object
- *             required: [file, target_group_id]
+ *             required: [file, campaign_id]
  *             properties:
  *               file:
  *                 type: string
  *                 format: binary
- *               target_group_id:
+ *               campaign_id:
  *                 type: string
- *                 description: UUID of the target group
+ *                 description: UUID of the campaign
  *               column_map:
  *                 type: string
  *                 description: 'JSON string mapping field names to Excel column headers, e.g. {"email":"Email Address","first_name":"First Name","last_name":"Last Name","notes":"Notes"}'
@@ -270,12 +273,12 @@ router.post(
   upload.single('file'),
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const { target_group_id, column_map: rawColMap } = req.body as {
-        target_group_id?: string
+      const { campaign_id, column_map: rawColMap } = req.body as {
+        campaign_id?: string
         column_map?: string
       }
-      if (!target_group_id) {
-        res.status(400).json({ error: 'target_group_id is required' })
+      if (!campaign_id) {
+        res.status(400).json({ error: 'campaign_id is required' })
         return
       }
       if (!req.file) {
@@ -292,15 +295,15 @@ router.post(
         return
       }
 
-      // Verify group belongs to company
-      const { data: group, error: groupErr } = await supabaseAdmin
-        .from('target_groups')
-        .select('id')
-        .eq('id', target_group_id)
+      // Verify campaign belongs to company and get its status + linked sequences/mailboxes
+      const { data: campaign, error: campErr } = await supabaseAdmin
+        .from('campaigns')
+        .select('id, status, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
+        .eq('id', campaign_id)
         .eq('company_id', req.user.company_id)
         .single()
-      if (groupErr || !group) {
-        res.status(404).json({ error: 'Target group not found' })
+      if (campErr || !campaign) {
+        res.status(404).json({ error: 'Campaign not found' })
         return
       }
 
@@ -345,10 +348,10 @@ router.post(
       }
 
       const emailCol = colMap.email
-      const leads = rows
+      const leadsToInsert = rows
         .map((row) => ({
           company_id: req.user.company_id,
-          target_group_id,
+          campaign_id,
           email: String(row[emailCol] ?? '').trim().toLowerCase(),
           first_name: colMap.first_name ? String(row[colMap.first_name] ?? '').trim() || null : null,
           last_name: colMap.last_name ? String(row[colMap.last_name] ?? '').trim() || null : null,
@@ -358,24 +361,95 @@ router.post(
         }))
         .filter((l) => l.email && l.email.includes('@'))
 
-      if (leads.length === 0) {
+      if (leadsToInsert.length === 0) {
         res.status(400).json({ error: 'No valid leads found in the file' })
         return
       }
 
-      // Upsert to avoid duplicates within the same target group.
-      // Note: requires unique constraint on (company_id, target_group_id, email).
-      // See supabase/migrations/003_leads_unique.sql for the constraint definition.
-      const { error: insertErr } = await supabaseAdmin
+      // Upsert to avoid duplicates within the same campaign.
+      const { data: insertedLeads, error: insertErr } = await supabaseAdmin
         .from('leads')
-        .upsert(leads, { onConflict: 'company_id,target_group_id,email', ignoreDuplicates: true })
+        .upsert(leadsToInsert, { onConflict: 'company_id,campaign_id,email', ignoreDuplicates: true })
         .select('id')
       if (insertErr) {
         res.status(400).json({ error: insertErr.message })
         return
       }
 
-      res.status(201).json({ imported: leads.length, message: `${leads.length} leads processed` })
+      // If campaign is active, enqueue email jobs for the newly imported leads
+      if (campaign.status === 'active' && insertedLeads && insertedLeads.length > 0) {
+        const sequenceIds = (campaign.campaign_sequences as { sequence_id: string }[]).map((s) => s.sequence_id)
+        const mailboxIds = (campaign.campaign_mailboxes as { mailbox_id: string }[]).map((m) => m.mailbox_id)
+
+        if (sequenceIds.length > 0 && mailboxIds.length > 0) {
+          const { data: mailboxRows } = await supabaseAdmin
+            .from('mailboxes')
+            .select('id, warmup_started_at, is_paused')
+            .in('id', mailboxIds)
+
+          const mailboxMap = new Map(
+            (mailboxRows ?? []).map((m: { id: string; warmup_started_at: string; is_paused: boolean }) => [
+              m.id,
+              { warmupStartedAt: new Date(m.warmup_started_at), isPaused: m.is_paused },
+            ])
+          )
+
+          for (const sequenceId of sequenceIds) {
+            const { data: firstStep } = await supabaseAdmin
+              .from('sequence_steps')
+              .select('id, delay_days')
+              .eq('sequence_id', sequenceId)
+              .order('step_order')
+              .limit(1)
+              .single()
+
+            if (!firstStep) continue
+
+            const sendImmediately = (firstStep as { delay_days: number }).delay_days === 0
+
+            const mailboxLeads = new Map<string, string[]>()
+            insertedLeads.forEach((lead: { id: string }, idx: number) => {
+              const mbId = mailboxIds[idx % mailboxIds.length]
+              if (!mailboxLeads.has(mbId)) mailboxLeads.set(mbId, [])
+              mailboxLeads.get(mbId)!.push(lead.id)
+            })
+
+            const jobs: Array<{ name: string; data: EmailJobData; opts: { delay: number } }> = []
+
+            for (const [mbId, mbLeads] of mailboxLeads) {
+              const mbInfo = mailboxMap.get(mbId)
+              if (mbInfo?.isPaused) continue
+
+              let scheduledTimes: Date[]
+              if (sendImmediately) {
+                scheduledTimes = mbLeads.map(() => new Date())
+              } else {
+                const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null)
+                scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
+              }
+
+              mbLeads.forEach((leadId, idx) => {
+                const delayMs = Math.max(0, scheduledTimes[idx].getTime() - Date.now())
+                jobs.push({
+                  name: `send-${leadId}-${sequenceId}-step1`,
+                  data: {
+                    campaignId: campaign_id,
+                    sequenceId,
+                    stepId: firstStep.id as string,
+                    leadId,
+                    mailboxId: mbId,
+                  } satisfies EmailJobData,
+                  opts: { delay: delayMs },
+                })
+              })
+            }
+
+            if (jobs.length > 0) await emailQueue.addBulk(jobs)
+          }
+        }
+      }
+
+      res.status(201).json({ imported: leadsToInsert.length, message: `${leadsToInsert.length} leads processed` })
     } catch (err) {
       if (err instanceof ZodError) {
         res.status(400).json({ error: err.errors })

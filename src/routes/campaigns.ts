@@ -2,9 +2,6 @@ import { Router, Request, Response, NextFunction } from 'express'
 import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
-import { emailQueue } from '../queues/emailQueue'
-import { EmailJobData } from '../types'
-import { getDailyLimit, computeScheduledTimes } from '../utils/warmup'
 
 const router = Router()
 router.use(authMiddleware)
@@ -22,11 +19,15 @@ router.use(authMiddleware)
  */
 router.get('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('campaigns')
-      .select('*, target_group:target_groups(name), campaign_sequences(sequence_id, sequence:sequences(name)), campaign_mailboxes(mailbox_id)')
+      .select('*, target_group:target_groups(name), campaign_sequences(sequence_id, sequence:sequences(name)), campaign_mailboxes(mailbox_id), leads(count)')
       .eq('company_id', req.user.company_id)
       .order('created_at', { ascending: false })
+    if (req.query.target_group_id) {
+      query = query.eq('target_group_id', req.query.target_group_id as string)
+    }
+    const { data, error } = await query
     if (error) {
       res.status(400).json({ error: error.message })
       return
@@ -104,87 +105,6 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
     await supabaseAdmin.from('campaign_mailboxes').insert(
       body.mailbox_ids.map((mb_id) => ({ campaign_id: campaign.id, mailbox_id: mb_id }))
     )
-
-    // 4. For each sequence, get step 1 and enqueue jobs for all active leads
-    // Leads are round-robin assigned across mailboxes
-    const { data: leads } = await supabaseAdmin
-      .from('leads')
-      .select('id')
-      .eq('target_group_id', body.target_group_id)
-      .eq('company_id', req.user.company_id)
-      .eq('status', 'active')
-
-    if (leads && leads.length > 0) {
-      // Fetch mailbox warmup dates to compute per-mailbox daily limits
-      const { data: mailboxRows } = await supabaseAdmin
-        .from('mailboxes')
-        .select('id, warmup_started_at, is_paused')
-        .in('id', body.mailbox_ids)
-
-      const mailboxMap = new Map(
-        (mailboxRows ?? []).map((m: { id: string; warmup_started_at: string; is_paused: boolean }) => [
-          m.id,
-          { warmupStartedAt: new Date(m.warmup_started_at), isPaused: m.is_paused },
-        ])
-      )
-
-      for (const sequenceId of body.sequence_ids) {
-        const { data: firstStep } = await supabaseAdmin
-          .from('sequence_steps')
-          .select('id, delay_days')
-          .eq('sequence_id', sequenceId)
-          .order('step_order')
-          .limit(1)
-          .single()
-
-        if (!firstStep) continue
-
-        const sendImmediately = (firstStep as { delay_days: number }).delay_days === 0
-
-        // Group leads by their assigned mailbox (round-robin)
-        const mailboxLeads = new Map<string, string[]>()
-        leads.forEach((lead: { id: string }, idx: number) => {
-          const mbId = body.mailbox_ids[idx % body.mailbox_ids.length]
-          if (!mailboxLeads.has(mbId)) mailboxLeads.set(mbId, [])
-          mailboxLeads.get(mbId)!.push(lead.id)
-        })
-
-        const jobs: Array<{ name: string; data: EmailJobData; opts: { delay: number } }> = []
-
-        for (const [mbId, mbLeads] of mailboxLeads) {
-          const mbInfo = mailboxMap.get(mbId)
-          if (mbInfo?.isPaused) {
-            console.warn(`[Campaign] Skipping paused mailbox ${mbId}`)
-            continue
-          }
-
-          let scheduledTimes: Date[]
-          if (sendImmediately) {
-            scheduledTimes = mbLeads.map(() => new Date())
-          } else {
-            const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null)
-            scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
-          }
-
-          mbLeads.forEach((leadId, idx) => {
-            const delayMs = Math.max(0, scheduledTimes[idx].getTime() - Date.now())
-            jobs.push({
-              name: `send-${leadId}-${sequenceId}-step1`,
-              data: {
-                campaignId: campaign.id as string,
-                sequenceId,
-                stepId: firstStep.id as string,
-                leadId,
-                mailboxId: mbId,
-              } satisfies EmailJobData,
-              opts: { delay: delayMs },
-            })
-          })
-        }
-
-        await emailQueue.addBulk(jobs)
-      }
-    }
 
     res.status(201).json(campaign)
   } catch (err) {
