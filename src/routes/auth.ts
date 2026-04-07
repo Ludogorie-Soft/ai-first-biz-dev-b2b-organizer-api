@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { z, ZodError } from 'zod'
+import { createClient } from '@supabase/supabase-js'
 import { supabaseAdmin } from '../config/supabase'
 import { sesClient } from '../config/ses'
 import { SendEmailCommand } from '@aws-sdk/client-ses'
@@ -180,7 +181,15 @@ router.post('/verify-email', async (req: Request, res: Response, next: NextFunct
 router.post('/login', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const body = loginSchema.parse(req.body)
-    const { data, error } = await supabaseAdmin.auth.signInWithPassword({
+    // Use a fresh client per login so signInWithPassword never sets a session
+    // on the shared supabaseAdmin instance — that would contaminate its
+    // Authorization header and break RLS bypass for all subsequent requests.
+    const loginClient = createClient(
+      process.env.SUPABASE_URL as string,
+      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      { auth: { persistSession: false, autoRefreshToken: false } }
+    )
+    const { data, error } = await loginClient.auth.signInWithPassword({
       email: body.email,
       password: body.password,
     })
@@ -227,7 +236,12 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction): P
 router.post('/refresh', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { refresh_token } = z.object({ refresh_token: z.string().min(1) }).parse(req.body)
-    const { data, error } = await supabaseAdmin.auth.refreshSession({ refresh_token })
+    const refreshClient = createClient(
+      process.env.SUPABASE_URL as string,
+      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      { auth: { persistSession: false, autoRefreshToken: false } }
+    )
+    const { data, error } = await refreshClient.auth.refreshSession({ refresh_token })
     if (error || !data.session) {
       res.status(401).json({ error: error?.message ?? 'Invalid refresh token' })
       return

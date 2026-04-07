@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { z, ZodError } from 'zod'
+import { createClient } from '@supabase/supabase-js'
 import { supabaseAdmin } from '../config/supabase'
 import { sesClient } from '../config/ses'
 import { SendEmailCommand } from '@aws-sdk/client-ses'
@@ -183,7 +184,12 @@ router.post('/accept-invite/register', async (req: Request, res: Response, next:
     // Only delete the invitation after successful registration
     await supabaseAdmin.from('invitations').delete().eq('id', inv.id)
 
-    const { data: session } = await supabaseAdmin.auth.signInWithPassword({ email: inv.email, password })
+    const signInClient = createClient(
+      process.env.SUPABASE_URL as string,
+      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      { auth: { persistSession: false, autoRefreshToken: false } }
+    )
+    const { data: session } = await signInClient.auth.signInWithPassword({ email: inv.email, password })
     res.status(201).json({
       access_token: session?.session?.access_token,
       refresh_token: session?.session?.refresh_token,
