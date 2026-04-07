@@ -21,7 +21,7 @@ Both processes start together when you run `npm run dev` (via `concurrently`). I
 
 - **Runtime:** Node.js + TypeScript
 - **Framework:** Express
-- **Queue:** BullMQ + Upstash Redis
+- **Queue:** BullMQ + Redis Cloud
 - **Database & Auth:** Supabase (PostgreSQL + Auth)
 - **Email Sending:** AWS SES
 - **Reply Catching:** IMAP (imapflow)
@@ -77,7 +77,7 @@ Swagger docs: `http://localhost:3000/api/docs`
 |---|---|---|
 | `SUPABASE_URL` | Always | Project URL from Supabase → Settings → Data API |
 | `SUPABASE_SERVICE_ROLE_KEY` | Always | Service role key (bypasses RLS — keep secret) |
-| `REDIS_URL` | Always | Upstash Redis URL starting with `rediss://` |
+| `REDIS_URL` | Always | Redis Cloud URL, e.g. `redis://default:password@host:port` |
 | `AWS_ACCESS_KEY_ID` | Worker only | AWS IAM key — create an IAM user with `AmazonSESFullAccess` |
 | `AWS_SECRET_ACCESS_KEY` | Worker only | AWS IAM secret — shown once at creation |
 | `AWS_REGION` | Worker only | SES region, e.g. `eu-west-1` |
@@ -124,8 +124,9 @@ Full interactive docs at `/api/docs`. Summary:
 | `POST` | `/api/org/invitations` | Send an invitation email |
 | `DELETE` | `/api/org/invitations/:id` | Revoke a pending invitation |
 | `GET` | `/api/org/invitations/check?token=` | Check invitation validity (public) |
-| `POST` | `/api/org/accept-invite/register` | Accept invitation and register |
-| `DELETE` | `/api/org/members/:id` | Remove a team member |
+| `POST` | `/api/org/accept-invite/register` | Accept invitation — create new account |
+| `POST` | `/api/org/accept-invite/login` | Accept invitation — existing user joins second company |
+| `DELETE` | `/api/org/members/:id` | Remove a team member from this company |
 
 ### Mailboxes
 | Method | Path | Description |
@@ -264,13 +265,15 @@ RLS is enforced on all tables using `public.get_auth_company_id()` — a `SECURI
 
 ## Organization Management
 
-The platform uses an **invite** model:
+The platform uses an **invite** model with multi-company support:
 
+- A user can belong to multiple companies simultaneously — managed via the `user_companies` join table
 - All team members have **owner-level** access (no role hierarchy)
 - New members join by accepting email invitations
 - Invitations expire after 24 hours
-- When accepting an invitation, users register directly (no need for existing account)
-- Members can be removed by any team member
+- **New users** — register directly via the invite link (no prior account needed)
+- **Existing users** — enter their existing password to join the new company; their first company remains accessible
+- Removing a member removes them from the company only — their account and other company memberships are unaffected
 
 ---
 
@@ -318,3 +321,4 @@ docker buildx build \
 
 > Run `docker login` first if not already authenticated.
 > The `--push` flag builds and pushes directly to Docker Hub in one step — no separate `docker push` needed.
+> If deploying to a Linux amd64 server (e.g. GCP), you can drop `linux/arm64` to speed up the build.
