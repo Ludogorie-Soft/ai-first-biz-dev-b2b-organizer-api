@@ -102,15 +102,21 @@ router.patch('/', async (req: Request, res: Response, next: NextFunction): Promi
  */
 router.get('/users', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
+    const { data: memberships, error: membershipError } = await supabaseAdmin
+      .from('user_companies')
+      .select('user_id')
+      .eq('company_id', req.user.company_id)
+    if (membershipError) { res.status(400).json({ error: membershipError.message }); return }
+
+    const userIds = (memberships ?? []).map((m: { user_id: string }) => m.user_id)
+    if (userIds.length === 0) { res.json([]); return }
+
     const { data, error } = await supabaseAdmin
       .from('users')
       .select('id, email, role, created_at')
-      .eq('company_id', req.user.company_id)
+      .in('id', userIds)
       .order('created_at')
-    if (error) {
-      res.status(400).json({ error: error.message })
-      return
-    }
+    if (error) { res.status(400).json({ error: error.message }); return }
     res.json(data)
   } catch (err) {
     next(err)

@@ -218,9 +218,78 @@ router.get('/invitations/check', async (req: Request, res: Response, next: NextF
       return
     }
     const companies = inv.companies as unknown as { name: string } | null
-    res.json({ email: inv.email, company_name: companies?.name })
+    const { data: existingUser } = await supabaseAdmin
+      .from('users').select('id').eq('email', inv.email).maybeSingle()
+    res.json({ email: inv.email, company_name: companies?.name, user_exists: !!existingUser })
   } catch (err) {
     if (err instanceof ZodError) { res.status(400).json({ error: 'Invalid token' }); return }
+    next(err)
+  }
+})
+
+// ── Accept invitation — existing user joins a second company ─────────────
+
+router.post('/accept-invite/login', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { token, password } = z.object({
+      token: z.string().uuid(),
+      password: z.string().min(1),
+    }).parse(req.body)
+
+    const { data: inv } = await supabaseAdmin
+      .from('invitations')
+      .select('id, company_id, email, expires_at')
+      .eq('token', token)
+      .single()
+
+    if (!inv) { res.status(400).json({ error: 'Invalid or expired invitation' }); return }
+    if (new Date(inv.expires_at) < new Date()) {
+      await supabaseAdmin.from('invitations').delete().eq('id', inv.id)
+      res.status(400).json({ error: 'Invitation has expired' })
+      return
+    }
+
+    const signInClient = createClient(
+      process.env.SUPABASE_URL as string,
+      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      { auth: { persistSession: false, autoRefreshToken: false } }
+    )
+    const { data: authData, error: signInError } = await signInClient.auth.signInWithPassword({
+      email: inv.email,
+      password,
+    })
+
+    if (signInError || !authData.session) {
+      res.status(401).json({ error: 'Invalid password' })
+      return
+    }
+
+    const userId = authData.user.id
+
+    // Add to company if not already a member
+    const { data: existing } = await supabaseAdmin
+      .from('user_companies')
+      .select('user_id')
+      .eq('user_id', userId)
+      .eq('company_id', inv.company_id)
+      .maybeSingle()
+
+    if (!existing) {
+      await supabaseAdmin
+        .from('user_companies')
+        .insert({ user_id: userId, company_id: inv.company_id })
+    }
+
+    await supabaseAdmin.from('invitations').delete().eq('id', inv.id)
+
+    res.json({
+      access_token: authData.session.access_token,
+      refresh_token: authData.session.refresh_token,
+      user: { id: userId, email: inv.email },
+      company_id: inv.company_id,
+    })
+  } catch (err) {
+    if (err instanceof ZodError) { res.status(400).json({ error: err.errors[0]?.message }); return }
     next(err)
   }
 })
@@ -233,12 +302,17 @@ router.delete('/members/:id', authMiddleware, async (req: Request, res: Response
     return
   }
   try {
-    const { data: member } = await supabaseAdmin
-      .from('users').select('id').eq('id', req.params.id as string)
-      .eq('company_id', req.user.company_id).single()
-    if (!member) { res.status(404).json({ error: 'Member not found' }); return }
+    const { data: membership } = await supabaseAdmin
+      .from('user_companies').select('user_id')
+      .eq('user_id', req.params.id as string)
+      .eq('company_id', req.user.company_id).maybeSingle()
+    if (!membership) { res.status(404).json({ error: 'Member not found' }); return }
 
-    await supabaseAdmin.auth.admin.deleteUser(req.params.id as string)
+    await supabaseAdmin
+      .from('user_companies')
+      .delete()
+      .eq('user_id', req.params.id as string)
+      .eq('company_id', req.user.company_id)
     res.status(204).send()
   } catch (err) { next(err) }
 })
