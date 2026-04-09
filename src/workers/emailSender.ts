@@ -91,6 +91,12 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         lead as { first_name: string | null; last_name: string | null; email: string; company_name: string | null; position: string | null }
       )
 
+      // Convert plain text body to HTML — preserve paragraph and line breaks
+      const htmlBody = body
+        .split(/\n\n+/)
+        .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
+        .join('\n')
+
       const mailboxEmail = (mailbox as { email: string }).email
 
       // Send via AWS SES — always from the mailbox email (must be SES-verified)
@@ -101,7 +107,7 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
           Destination: { ToAddresses: [(lead as { email: string }).email] },
           Message: {
             Subject: { Data: subject, Charset: 'UTF-8' },
-            Body: { Html: { Data: body, Charset: 'UTF-8' } },
+            Body: { Html: { Data: htmlBody, Charset: 'UTF-8' } },
           },
         })
       )
