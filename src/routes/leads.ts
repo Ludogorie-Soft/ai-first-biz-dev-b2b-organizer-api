@@ -4,9 +4,7 @@ import XLSX from 'xlsx'
 import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
-import { emailQueue } from '../queues/emailQueue'
-import { EmailJobData } from '../types'
-import { getDailyLimit, computeScheduledTimes } from '../utils/warmup'
+import { enqueueCampaignJobs } from '../utils/enqueueCampaignJobs'
 
 const router = Router()
 router.use(authMiddleware)
@@ -376,77 +374,12 @@ router.post(
         return
       }
 
-      // If campaign is active, enqueue email jobs for the newly imported leads
+      // If campaign is active, enqueue step-1 jobs for the newly imported leads
       if (campaign.status === 'active' && insertedLeads && insertedLeads.length > 0) {
-        const sequenceIds = (campaign.campaign_sequences as { sequence_id: string }[]).map((s) => s.sequence_id)
-        const mailboxIds = (campaign.campaign_mailboxes as { mailbox_id: string }[]).map((m) => m.mailbox_id)
-
-        if (sequenceIds.length > 0 && mailboxIds.length > 0) {
-          const { data: mailboxRows } = await supabaseAdmin
-            .from('mailboxes')
-            .select('id, warmup_started_at, is_paused')
-            .in('id', mailboxIds)
-
-          const mailboxMap = new Map(
-            (mailboxRows ?? []).map((m: { id: string; warmup_started_at: string; is_paused: boolean }) => [
-              m.id,
-              { warmupStartedAt: new Date(m.warmup_started_at), isPaused: m.is_paused },
-            ])
-          )
-
-          for (const sequenceId of sequenceIds) {
-            const { data: firstStep } = await supabaseAdmin
-              .from('sequence_steps')
-              .select('id, delay_days')
-              .eq('sequence_id', sequenceId)
-              .order('step_order')
-              .limit(1)
-              .single()
-
-            if (!firstStep) continue
-
-            const sendImmediately = (firstStep as { delay_days: number }).delay_days === 0
-
-            const mailboxLeads = new Map<string, string[]>()
-            insertedLeads.forEach((lead: { id: string }, idx: number) => {
-              const mbId = mailboxIds[idx % mailboxIds.length]
-              if (!mailboxLeads.has(mbId)) mailboxLeads.set(mbId, [])
-              mailboxLeads.get(mbId)!.push(lead.id)
-            })
-
-            const jobs: Array<{ name: string; data: EmailJobData; opts: { delay: number } }> = []
-
-            for (const [mbId, mbLeads] of mailboxLeads) {
-              const mbInfo = mailboxMap.get(mbId)
-              if (mbInfo?.isPaused) continue
-
-              let scheduledTimes: Date[]
-              if (sendImmediately) {
-                scheduledTimes = mbLeads.map(() => new Date())
-              } else {
-                const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null)
-                scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
-              }
-
-              mbLeads.forEach((leadId, idx) => {
-                const delayMs = Math.max(0, scheduledTimes[idx].getTime() - Date.now())
-                jobs.push({
-                  name: `send-${leadId}-${sequenceId}-step1`,
-                  data: {
-                    campaignId: campaign_id,
-                    sequenceId,
-                    stepId: firstStep.id as string,
-                    leadId,
-                    mailboxId: mbId,
-                  } satisfies EmailJobData,
-                  opts: { delay: delayMs },
-                })
-              })
-            }
-
-            if (jobs.length > 0) await emailQueue.addBulk(jobs)
-          }
-        }
+        const leadIds = insertedLeads.map((l: { id: string }) => l.id)
+        await enqueueCampaignJobs(campaign_id, leadIds).catch((e: Error) =>
+          console.error('[Leads] Failed to enqueue jobs after import:', e.message)
+        )
       }
 
       res.status(201).json({ imported: leadsToInsert.length, message: `${leadsToInsert.length} leads processed` })

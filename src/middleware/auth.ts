@@ -53,7 +53,7 @@ async function authMiddleware(req: Request, res: Response, next: NextFunction): 
     id: user.id,
     email: user.email ?? '',
     company_id: companyId,
-    role: profile.role as 'owner' | 'admin' | 'member',
+    role: profile.role as 'owner' | 'admin' | 'member' | 'global_admin',
   }
   next()
 }

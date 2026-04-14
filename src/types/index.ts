@@ -2,7 +2,7 @@ export interface User {
   id: string
   email: string
   company_id: string
-  role: 'owner' | 'admin' | 'member'
+  role: 'owner' | 'admin' | 'member' | 'global_admin'
 }
 
 export interface Lead {
@@ -34,6 +34,7 @@ export interface Mailbox {
   company_id: string
   email: string
   imap_config: EncryptedPayload | null
+  ses_status: 'pending' | 'active'
   created_at: string
 }
 
@@ -61,4 +62,4 @@ export interface EmailJobData {
 
 export type ReplyCategory = 'positive' | 'negative' | 'neutral' | 'out_of_office'
 export type EmailLogStatus = 'pending' | 'sent' | 'failed' | 'bounced'
-export type CampaignStatus = 'draft' | 'active' | 'paused' | 'completed'
+export type CampaignStatus = 'draft' | 'active' | 'paused' | 'completed' | 'pending_mailbox_approval'

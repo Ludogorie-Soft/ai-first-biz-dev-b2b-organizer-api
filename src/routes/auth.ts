@@ -197,11 +197,18 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction): P
       res.status(401).json({ error: error.message })
       return
     }
+
+    const { data: profile } = await supabaseAdmin
+      .from('users')
+      .select('role')
+      .eq('id', data.user.id)
+      .single()
+
     res.json({
       access_token: data.session.access_token,
       refresh_token: data.session.refresh_token,
       expires_in: data.session.expires_in,
-      user: { id: data.user.id, email: data.user.email },
+      user: { id: data.user.id, email: data.user.email, role: profile?.role ?? 'member' },
     })
   } catch (err) {
     if (err instanceof ZodError) {

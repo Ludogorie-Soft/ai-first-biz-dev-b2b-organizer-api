@@ -19,6 +19,7 @@ import dashboardRoutes from './routes/dashboard'
 import webhookRoutes from './routes/webhooks'
 import orgRoutes from './routes/org'
 import companiesRoutes from './routes/companies'
+import adminRoutes from './routes/admin'
 
 const app: Application = express()
 
@@ -66,6 +67,7 @@ app.use('/api/campaigns', campaignRoutes)
 app.use('/api/campaigns', dashboardRoutes)
 app.use('/api/org', orgRoutes)
 app.use('/api/companies', companiesRoutes)
+app.use('/api/admin', adminRoutes)
 app.use('/webhooks/ses', webhookRoutes)
 
 // Health check

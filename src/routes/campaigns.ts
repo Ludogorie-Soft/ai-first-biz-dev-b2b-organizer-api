@@ -79,7 +79,24 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
     })
     const body = schema.parse(req.body)
 
-    // 1. Create campaign
+    // 1. Check if any selected mailboxes are still pending SES approval
+    const { data: mailboxes, error: mbErr } = await supabaseAdmin
+      .from('mailboxes')
+      .select('id, ses_status')
+      .in('id', body.mailbox_ids)
+      .eq('company_id', req.user.company_id)
+    if (mbErr) {
+      res.status(400).json({ error: mbErr.message })
+      return
+    }
+    if (!mailboxes || mailboxes.length !== body.mailbox_ids.length) {
+      res.status(400).json({ error: 'One or more mailboxes not found' })
+      return
+    }
+    const hasPendingMailbox = mailboxes.some((mb: { ses_status: string }) => mb.ses_status === 'pending')
+    const campaignStatus = hasPendingMailbox ? 'pending_mailbox_approval' : 'active'
+
+    // 2. Create campaign
     const { data: campaign, error: campErr } = await supabaseAdmin
       .from('campaigns')
       .insert({
@@ -87,7 +104,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
         target_group_id: body.target_group_id,
         name: body.name,
         description: body.description,
-        status: 'active',
+        status: campaignStatus,
       })
       .select()
       .single()
@@ -96,12 +113,12 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
       return
     }
 
-    // 2. Link sequences
+    // 3. Link sequences
     await supabaseAdmin.from('campaign_sequences').insert(
       body.sequence_ids.map((seq_id) => ({ campaign_id: campaign.id, sequence_id: seq_id }))
     )
 
-    // 3. Link mailboxes
+    // 4. Link mailboxes
     await supabaseAdmin.from('campaign_mailboxes').insert(
       body.mailbox_ids.map((mb_id) => ({ campaign_id: campaign.id, mailbox_id: mb_id }))
     )
@@ -200,6 +217,20 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const body = schema.parse(req.body)
+
+    // Prevent manually activating a campaign stuck on mailbox approval
+    if (body.status === 'active') {
+      const { data: current } = await supabaseAdmin
+        .from('campaigns')
+        .select('status')
+        .eq('id', req.params.id)
+        .eq('company_id', req.user.company_id)
+        .single()
+      if (current?.status === 'pending_mailbox_approval') {
+        res.status(400).json({ error: 'Campaign cannot be activated until all mailboxes are approved in SES' })
+        return
+      }
+    }
 
     const { data, error } = await supabaseAdmin
       .from('campaigns')

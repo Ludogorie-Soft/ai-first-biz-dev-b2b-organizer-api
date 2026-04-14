@@ -3,6 +3,8 @@ import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
 import { encrypt } from '../utils/encrypt'
+import { sesClient } from '../config/ses'
+import { SendEmailCommand } from '@aws-sdk/client-ses'
 
 const router = Router()
 router.use(authMiddleware)
@@ -35,7 +37,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
   try {
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .select('id, email, is_paused, warmup_started_at, created_at')
+      .select('id, email, ses_status, is_paused, warmup_started_at, created_at')
       .eq('company_id', req.user.company_id)
       .order('created_at')
     if (error) {
@@ -83,13 +85,19 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
     const encryptedConfig = encrypt(body.imap_config)
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .insert({ company_id: req.user.company_id, email: body.email, imap_config: encryptedConfig })
-      .select('id, email, created_at')
+      .insert({ company_id: req.user.company_id, email: body.email, imap_config: encryptedConfig, ses_status: 'pending' })
+      .select('id, email, ses_status, created_at')
       .single()
     if (error) {
       res.status(400).json({ error: error.message })
       return
     }
+
+    // Notify all global admins about the new pending mailbox
+    notifyAdminsNewMailbox(body.email, req.user.company_id).catch((e: Error) =>
+      console.error('[Mailboxes] Failed to notify admins:', e.message)
+    )
+
     res.status(201).json(data)
   } catch (err) {
     if (err instanceof ZodError) {
@@ -99,6 +107,58 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
     next(err)
   }
 })
+
+async function notifyAdminsNewMailbox(mailboxEmail: string, companyId: string): Promise<void> {
+  // Get company name
+  const { data: company } = await supabaseAdmin
+    .from('companies')
+    .select('name')
+    .eq('id', companyId)
+    .single()
+
+  // Get all global admins
+  const { data: admins } = await supabaseAdmin
+    .from('users')
+    .select('email')
+    .eq('role', 'global_admin')
+
+  if (!admins || admins.length === 0) return
+
+  const companyName = company?.name ?? 'Unknown company'
+  const adminEmails = admins.map((a: { email: string }) => a.email)
+
+  await sesClient.send(new SendEmailCommand({
+    Source: process.env.SES_FROM_EMAIL!,
+    Destination: { ToAddresses: adminEmails },
+    Message: {
+      Subject: { Data: `[BizDev B2B] New mailbox pending SES approval: ${mailboxEmail}`, Charset: 'UTF-8' },
+      Body: {
+        Html: {
+          Charset: 'UTF-8',
+          Data: `
+            <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px">
+              <h2 style="color:#1e293b">New mailbox awaiting SES approval</h2>
+              <p style="color:#475569">A new sender mailbox was just registered and needs to be added to AWS SES before it can be used.</p>
+              <table style="width:100%;border-collapse:collapse;margin:20px 0">
+                <tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px">Mailbox</td>
+                  <td style="padding:8px 0;color:#1e293b;font-weight:600;font-size:14px">${mailboxEmail}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#64748b;font-size:14px">Company</td>
+                  <td style="padding:8px 0;color:#1e293b;font-weight:600;font-size:14px">${companyName}</td>
+                </tr>
+              </table>
+              <p style="color:#475569;font-size:14px">Once you add this address to SES, approve it in the admin panel so associated campaigns can start sending.</p>
+              <a href="${process.env.FRONTEND_URL}/admin" style="display:inline-block;margin-top:16px;padding:12px 24px;background:#4f46e5;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">
+                Open Admin Panel
+              </a>
+            </div>`,
+        },
+      },
+    },
+  }))
+}
 
 /**
  * @swagger
@@ -121,7 +181,7 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
     res.status(400).json({ error: 'Invalid mailbox ID' })
     return
   }
-  if (!['owner', 'admin'].includes(req.user.role)) {
+  if (!['owner', 'admin', 'global_admin'].includes(req.user.role)) {
     res.status(403).json({ error: 'Only owners and admins can delete mailboxes' })
     return
   }
