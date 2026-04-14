@@ -8,6 +8,7 @@ import { mergeVars } from '../utils/mergeVars'
 import { emailQueue } from '../queues/emailQueue'
 import { EmailJobData } from '../types'
 import { getDailyLimit, delayMsForNextStep } from '../utils/warmup'
+import { ensureUnsubscribeToken } from '../utils/unsubscribeTokens'
 
 function createEmailSenderWorker(): Worker<EmailJobData> {
   const worker = new Worker<EmailJobData>(
@@ -99,6 +100,33 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
 
       const mailboxEmail = (mailbox as { email: string }).email
 
+      const tokenRecord = await ensureUnsubscribeToken(
+        leadId,
+        (lead as { company_id: string }).company_id
+      )
+
+      console.log(`[Worker] unsubscribe tokenRecord for lead ${leadId}:`, tokenRecord.token)
+
+      const unsubscribeUrl = `${process.env.FRONTEND_URL}/unsubscribe?token=${tokenRecord.token}`
+
+      const unsubscribeBlock =
+        `\n<p style="margin-top:32px;font-size:11px;color:#94a3b8;text-align:center">` +
+        `You received this email because you are on our outreach list. ` +
+        `<a href="${unsubscribeUrl}" style="color:#94a3b8">Unsubscribe</a></p>`
+
+      // RFC 8058 one-click unsubscribe headers (required by Google/Yahoo for bulk senders)
+      const apiUnsubscribeUrl = `${process.env.API_URL}/api/unsubscribe?token=${tokenRecord.token}`
+      const emailHtml = htmlBody + unsubscribeBlock
+
+      console.log(
+        `[Worker pid=${process.pid}] Prepared email HTML for job ${job.id}, lead ${leadId}: ` +
+        `containsUnsubscribe=${emailHtml.includes(unsubscribeUrl)} length=${emailHtml.length}`
+      )
+
+      if (!emailHtml.includes(unsubscribeUrl)) {
+        throw new Error(`Unsubscribe link missing from rendered HTML for lead ${leadId}`)
+      }
+
       // Send via AWS SES — always from the mailbox email (must be SES-verified)
       await sesClient.send(
         new SendEmailCommand({
@@ -107,8 +135,14 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
           Destination: { ToAddresses: [(lead as { email: string }).email] },
           Message: {
             Subject: { Data: subject, Charset: 'UTF-8' },
-            Body: { Html: { Data: htmlBody, Charset: 'UTF-8' } },
+            Body: { Html: { Data: emailHtml, Charset: 'UTF-8' } },
           },
+          ...({
+            Headers: [
+              { Name: 'List-Unsubscribe', Value: `<${apiUnsubscribeUrl}>` },
+              { Name: 'List-Unsubscribe-Post', Value: 'List-Unsubscribe=One-Click' },
+            ],
+          } as Record<string, unknown>),
         })
       )
 

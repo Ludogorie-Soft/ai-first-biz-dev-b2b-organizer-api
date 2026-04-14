@@ -11,6 +11,8 @@ const WORKER_REQUIRED_VARS = [
   'AWS_REGION',
   'SES_FROM_EMAIL',
   'IMAP_ENCRYPTION_KEY',
+  'FRONTEND_URL',
+  'API_URL',
 ] as const
 
 export function validateEnv(mode: 'server' | 'worker' = 'server'): void {

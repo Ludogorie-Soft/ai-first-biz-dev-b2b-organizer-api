@@ -5,6 +5,7 @@ import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
 import { enqueueCampaignJobs } from '../utils/enqueueCampaignJobs'
+import { ensureUnsubscribeTokens } from '../utils/unsubscribeTokens'
 
 const router = Router()
 router.use(authMiddleware)
@@ -166,6 +167,17 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
       res.status(404).json({ error: 'Lead not found' })
       return
     }
+
+    // When manually re-activating a lead, remove them from the suppression list
+    // so future imports of the same email are not auto-suppressed.
+    if (body.status === 'active') {
+      await supabaseAdmin
+        .from('suppressed_emails')
+        .delete()
+        .eq('company_id', req.user.company_id)
+        .eq('email', (data as { email: string }).email)
+    }
+
     res.json(data)
   } catch (err) {
     if (err instanceof ZodError) {
@@ -374,12 +386,60 @@ router.post(
         return
       }
 
-      // If campaign is active, enqueue step-1 jobs for the newly imported leads
-      if (campaign.status === 'active' && insertedLeads && insertedLeads.length > 0) {
+      if (insertedLeads && insertedLeads.length > 0) {
         const leadIds = insertedLeads.map((l: { id: string }) => l.id)
-        await enqueueCampaignJobs(campaign_id, leadIds).catch((e: Error) =>
-          console.error('[Leads] Failed to enqueue jobs after import:', e.message)
-        )
+
+        // Generate unsubscribe tokens for all newly inserted leads.
+        // Awaited so the token exists before jobs are enqueued and the worker runs.
+        try {
+          await ensureUnsubscribeTokens(
+            leadIds.map((leadId: string) => ({ lead_id: leadId, company_id: req.user.company_id }))
+          )
+        } catch (err) {
+          console.error(
+            '[Leads] Failed to create unsubscribe tokens:',
+            err instanceof Error ? err.message : err
+          )
+        }
+
+        // Check suppression list — emails that previously unsubscribed must stay unsubscribed
+        // even when re-imported into a new campaign after the old one was deleted.
+        const importedEmails = leadsToInsert.map((l) => l.email)
+        const { data: suppressed } = await supabaseAdmin
+          .from('suppressed_emails')
+          .select('email')
+          .eq('company_id', req.user.company_id)
+          .in('email', importedEmails)
+
+        const suppressedEmails = new Set((suppressed ?? []).map((s: { email: string }) => s.email))
+
+        if (suppressedEmails.size > 0) {
+          await supabaseAdmin
+            .from('leads')
+            .update({ status: 'unsubscribed' })
+            .eq('company_id', req.user.company_id)
+            .eq('campaign_id', campaign_id)
+            .in('email', [...suppressedEmails])
+        }
+
+        // Fetch the active lead IDs after suppression so we don't enqueue jobs for suppressed leads.
+        // We re-query because insertedLeads only contains { id } with no email field.
+        const { data: activeLeads } = await supabaseAdmin
+          .from('leads')
+          .select('id')
+          .eq('company_id', req.user.company_id)
+          .eq('campaign_id', campaign_id)
+          .eq('status', 'active')
+          .in('id', leadIds)
+
+        const activeLeadIds = (activeLeads ?? []).map((l: { id: string }) => l.id)
+
+        // If campaign is active, enqueue step-1 jobs for non-suppressed leads only
+        if (campaign.status === 'active' && activeLeadIds.length > 0) {
+          await enqueueCampaignJobs(campaign_id, activeLeadIds).catch((e: Error) =>
+            console.error('[Leads] Failed to enqueue jobs after import:', e.message)
+          )
+        }
       }
 
       res.status(201).json({ imported: leadsToInsert.length, message: `${leadsToInsert.length} leads processed` })

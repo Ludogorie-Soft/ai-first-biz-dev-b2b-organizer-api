@@ -58,6 +58,12 @@ supabase/migrations/004_mailbox_warmup.sql
 supabase/migrations/005_email_verifications.sql
 supabase/migrations/006_org_management.sql
 supabase/migrations/007_simplify_org.sql
+supabase/migrations/008_campaigns_direct_leads.sql
+supabase/migrations/009_leads_campaign_direct.sql
+supabase/migrations/010_email_tracking.sql
+supabase/migrations/011_global_admin.sql
+supabase/migrations/012_set_global_admins.sql
+supabase/migrations/013_unsubscribe_tokens.sql
 ```
 
 ### 4. Start development
@@ -75,16 +81,17 @@ Swagger docs: `http://localhost:3000/api/docs`
 
 | Variable | Required | Description |
 |---|---|---|
-| `SUPABASE_URL` | Always | Project URL from Supabase → Settings → Data API |
+| `SUPABASE_URL` | Always | Project URL from Supabase → Settings → Data API, e.g. `https://your-project-ref.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | Always | Service role key (bypasses RLS — keep secret) |
-| `REDIS_URL` | Always | Redis Cloud URL, e.g. `redis://default:password@host:port` |
+| `REDIS_URL` | Always | Redis Cloud / Upstash URL, e.g. `rediss://default:password@host:port` |
+| `FRONTEND_URL` | Always | Base URL of the frontend app — used in invitation & admin notification emails, e.g. `http://localhost:3001` |
+| `API_URL` | Always | Public base URL of this API — used in `List-Unsubscribe` email headers (RFC 8058), e.g. `http://localhost:3000` |
 | `AWS_ACCESS_KEY_ID` | Worker only | AWS IAM key — create an IAM user with `AmazonSESFullAccess` |
 | `AWS_SECRET_ACCESS_KEY` | Worker only | AWS IAM secret — shown once at creation |
-| `AWS_REGION` | Worker only | SES region, e.g. `eu-west-1` |
+| `AWS_REGION` | Worker only | SES region where your sending identity is verified, e.g. `eu-west-1` |
 | `SES_FROM_EMAIL` | Worker only | Verified sender email in AWS SES |
 | `SES_WEBHOOK_SECRET` | Worker only | Random string to protect the bounce webhook URL |
 | `IMAP_ENCRYPTION_KEY` | Worker only | 64 hex characters (32 random bytes) |
-| `FRONTEND_URL` | Always | Base URL of the frontend app (for invitation emails), e.g. `http://localhost:3001` |
 | `PORT` | Optional | Defaults to `3000` |
 
 Generate the encryption key:
@@ -170,6 +177,17 @@ Full interactive docs at `/api/docs`. Summary:
 | `PATCH` | `/api/campaigns/:id` | Update status (`active`, `paused`, `completed`) or name |
 | `GET` | `/api/campaigns/:id/stats` | Get stats (sent / pending / replied + breakdown) |
 
+### Admin (global_admin role only)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/admin/mailboxes` | List all mailboxes with `ses_status = pending` across all companies |
+| `PATCH` | `/api/admin/mailboxes/:id/approve` | Verify SES identity, mark mailbox active, activate waiting campaigns |
+
+### Unsubscribe (public — no auth)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/unsubscribe` | Unsubscribe a lead by token (accepts token in JSON body or query string) |
+
 ### Webhooks
 | Method | Path | Description |
 |---|---|---|
@@ -186,9 +204,11 @@ Listens to the BullMQ `email-sending` queue. When `POST /api/campaigns` is calle
 2. Checks today's send count against the daily limit — requeues for tomorrow if exceeded
 3. Checks if the lead is still `active` — skips if `replied`, `unsubscribed`, etc.
 4. Merges `{{first_name}}`, `{{last_name}}`, `{{email}}`, `{{full_name}}` into the subject and body
-5. Sends the email via AWS SES
-6. Writes a row to `email_logs` with status `sent`
-7. If there is a next sequence step, schedules it at a random time within working hours on the target day
+5. Fetches the lead's unsubscribe token and appends an unsubscribe link to the email body
+6. Adds `List-Unsubscribe` and `List-Unsubscribe-Post` headers (RFC 8058 one-click unsubscribe)
+7. Sends the email via AWS SES
+8. Writes a row to `email_logs` with status `sent`
+9. If there is a next sequence step, schedules it at a random time within working hours on the target day
 
 ### Reply Catcher
 Polls every 5 minutes. For each mailbox:
@@ -207,7 +227,7 @@ Polls every 5 minutes. For each mailbox:
 
 ## Email Warmup & Deliverability
 
-To avoid the spam folder, emails are sent within a working window (09:00–17:00 UTC) with random 3–8 minute gaps between sends. Daily limits ramp up automatically per inbox:
+To avoid the spam folder, emails are sent within a working window (09:00–17:00 **Sofia time**, Europe/Sofia) with random 3–8 minute gaps between sends. Daily limits ramp up automatically per inbox:
 
 | Days since mailbox created | Daily limit |
 |---|---|
@@ -258,6 +278,13 @@ For non-standard headers:
 | `005_email_verifications.sql` | Adds `is_verified` and `verification_code` for email verification |
 | `006_org_management.sql` | Creates `invitations` table for invite-only team management |
 | `007_simplify_org.sql` | Removes `join_requests` and `audit_logs` (simplified org model) |
+| `008_campaigns_direct_leads.sql` | Adds `campaign_id` directly to leads (phase 1) |
+| `009_leads_campaign_direct.sql` | Migrates leads to campaign-direct model, drops target group FK |
+| `010_email_tracking.sql` | Adds open/click tracking columns to `email_logs` |
+| `011_global_admin.sql` | Adds `global_admin` role, `ses_status` on mailboxes, `pending_mailbox_approval` campaign status |
+| `012_set_global_admins.sql` | Grants `global_admin` role to the configured admin emails |
+| `013_unsubscribe_tokens.sql` | Creates `unsubscribe_tokens` table for GDPR one-click unsubscribe |
+| `014_suppressed_emails.sql` | Creates `suppressed_emails` table — persistent suppression list that survives campaign deletion |
 
 RLS is enforced on all tables using `public.get_auth_company_id()` — a `SECURITY DEFINER` function that prevents infinite recursion when querying the `users` table from within a policy.
 
@@ -314,7 +341,7 @@ docker buildx create --name multibuilder --driver docker-container --use
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t name/b2b-organizer-api:latest \
+  -t ludogoriesoft/b2b-organizer-api:latest \
   --push \
   ./ai-first-biz-dev-b2b-organizer-api
 ```

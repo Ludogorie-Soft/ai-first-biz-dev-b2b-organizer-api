@@ -7,10 +7,10 @@ import { startReplyCatcher } from './src/workers/replyCatcher'
 import { Worker } from 'bullmq'
 import { EmailJobData } from './src/types'
 
-console.log('[Worker] Starting email sender worker...')
+console.log(`[Worker] Starting email sender worker (pid=${process.pid})...`)
 const emailWorker: Worker<EmailJobData> = createEmailSenderWorker()
 
-console.log('[Worker] Starting reply catcher...')
+console.log(`[Worker] Starting reply catcher (pid=${process.pid})...`)
 const replyCatcherTimer: ReturnType<typeof setInterval> = startReplyCatcher()
 
 // Graceful shutdown
