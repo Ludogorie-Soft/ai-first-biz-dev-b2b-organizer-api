@@ -8,8 +8,9 @@ export interface User {
 export interface Lead {
   id: string
   company_id: string
-  target_group_id: string
+  campaign_id: string
   email: string
+  office_email: string | null
   first_name: string | null
   last_name: string | null
   company_name: string | null

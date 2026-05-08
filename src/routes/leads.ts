@@ -13,6 +13,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 
 interface ColumnMap {
   email: string | null
+  office_email: string | null
   first_name: string | null
   last_name: string | null
   company_name: string | null
@@ -328,7 +329,7 @@ router.post(
       }
 
       // Column mapping: explicit map or auto-detect
-      let colMap: ColumnMap = { email: null, first_name: null, last_name: null, company_name: null, position: null, notes: null }
+      let colMap: ColumnMap = { email: null, office_email: null, first_name: null, last_name: null, company_name: null, position: null, notes: null }
       const hasColMap = rawColMap && rawColMap.trim().startsWith('{')
       if (hasColMap) {
         try {
@@ -344,6 +345,7 @@ router.post(
           headers.find((h) => candidates.includes(h.toLowerCase().trim())) ?? null
         colMap = {
           email: find(['email', 'e-mail', 'email address']),
+          office_email: find(['office email', 'office_email', 'office e-mail', 'work email', 'company email']),
           first_name: find(['first_name', 'first name', 'firstname', 'name']),
           last_name: find(['last_name', 'last name', 'lastname', 'surname']),
           company_name: find(['company_name', 'company name', 'company', 'organization', 'organisation']),
@@ -363,6 +365,7 @@ router.post(
           company_id: req.user.company_id,
           campaign_id,
           email: String(row[emailCol] ?? '').trim().toLowerCase(),
+          office_email: colMap.office_email ? String(row[colMap.office_email] ?? '').trim().toLowerCase() || null : null,
           first_name: colMap.first_name ? String(row[colMap.first_name] ?? '').trim() || null : null,
           last_name: colMap.last_name ? String(row[colMap.last_name] ?? '').trim() || null : null,
           company_name: colMap.company_name ? String(row[colMap.company_name] ?? '').trim() || null : null,
@@ -382,6 +385,13 @@ router.post(
         .upsert(leadsToInsert, { onConflict: 'company_id,campaign_id,email', ignoreDuplicates: true })
         .select('id')
       if (insertErr) {
+        const lowerMessage = insertErr.message.toLowerCase()
+        if (lowerMessage.includes('office_email') && lowerMessage.includes('column')) {
+          res.status(400).json({
+            error: 'Database is missing leads.office_email. Run migration 015_leads_office_email.sql.',
+          })
+          return
+        }
         res.status(400).json({ error: insertErr.message })
         return
       }

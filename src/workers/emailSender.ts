@@ -127,12 +127,18 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         throw new Error(`Unsubscribe link missing from rendered HTML for lead ${leadId}`)
       }
 
+      const primaryEmail = (lead as { email: string }).email
+      const officeEmail = (lead as { office_email?: string | null }).office_email?.trim().toLowerCase() || null
+      const toAddresses = officeEmail && officeEmail !== primaryEmail
+        ? [primaryEmail, officeEmail]
+        : [primaryEmail]
+
       // Send via AWS SES — always from the mailbox email (must be SES-verified)
       await sesClient.send(
         new SendEmailCommand({
           Source: mailboxEmail,
           ReplyToAddresses: [mailboxEmail],
-          Destination: { ToAddresses: [(lead as { email: string }).email] },
+          Destination: { ToAddresses: toAddresses },
           Message: {
             Subject: { Data: subject, Charset: 'UTF-8' },
             Body: { Html: { Data: emailHtml, Charset: 'UTF-8' } },

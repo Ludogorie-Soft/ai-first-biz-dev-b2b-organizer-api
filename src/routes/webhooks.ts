@@ -136,11 +136,11 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     for (const recipient of bounce.bouncedRecipients) {
       const email = recipient.emailAddress.toLowerCase()
 
-      // Mark lead as bounced
+      // Mark lead as bounced (match both personal and office email fields)
       const { data: leads } = await supabaseAdmin
         .from('leads')
         .update({ status: 'bounced' })
-        .eq('email', email)
+        .or(`email.eq.${email},office_email.eq.${email}`)
         .select('id, company_id')
 
       // Update the most recent email_log for this lead to bounced
@@ -180,7 +180,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       await supabaseAdmin
         .from('leads')
         .update({ status: 'opted_out' })
-        .eq('email', email)
+        .or(`email.eq.${email},office_email.eq.${email}`)
 
       console.log(`[Webhook] Complaint (opted out): ${email}`)
     }
