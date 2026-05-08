@@ -6,6 +6,14 @@ import { sesClient } from '../config/ses'
 import { GetIdentityVerificationAttributesCommand } from '@aws-sdk/client-ses'
 import { enqueueCampaignJobs } from '../utils/enqueueCampaignJobs'
 
+function getMondayUtcMidnight(): Date {
+  const monday = new Date()
+  monday.setUTCHours(0, 0, 0, 0)
+  const daysFromMonday = (monday.getUTCDay() + 6) % 7
+  monday.setUTCDate(monday.getUTCDate() - daysFromMonday)
+  return monday
+}
+
 const router = Router()
 router.use(authMiddleware)
 
@@ -191,6 +199,143 @@ router.patch('/mailboxes/:id/approve', async (req: Request, res: Response, next:
     }
 
     res.json({ mailbox, activated_campaigns: campaignsToActivate.length })
+  } catch (err) {
+    next(err)
+  }
+})
+
+const mailboxLimitsSchema = z
+  .object({
+    daily_email_limit: z.number().int().positive(),
+    weekly_email_limit: z.number().int().positive(),
+  })
+  .refine((d) => d.weekly_email_limit >= d.daily_email_limit, {
+    message: 'Weekly limit must be greater than or equal to daily limit',
+    path: ['weekly_email_limit'],
+  })
+
+/**
+ * @swagger
+ * /admin/mailboxes/limits:
+ *   get:
+ *     summary: List all mailboxes with their email limits and current usage (global admin only)
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200:
+ *         description: Array of mailboxes with limit config and usage stats
+ */
+router.get('/mailboxes/limits', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('mailboxes')
+      .select('id, email, daily_email_limit, weekly_email_limit, company:companies(id, name)')
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      res.status(400).json({ error: error.message })
+      return
+    }
+
+    const todayStart = new Date()
+    todayStart.setUTCHours(0, 0, 0, 0)
+    const weekStart = getMondayUtcMidnight()
+
+    const result = await Promise.all(
+      (data ?? []).map(async (mb: any) => {
+        const [{ count: sentToday }, { count: sentThisWeek }] = await Promise.all([
+          supabaseAdmin
+            .from('email_logs')
+            .select('id', { count: 'exact', head: true })
+            .eq('mailbox_id', mb.id)
+            .eq('status', 'sent')
+            .gte('sent_at', todayStart.toISOString()),
+          supabaseAdmin
+            .from('email_logs')
+            .select('id', { count: 'exact', head: true })
+            .eq('mailbox_id', mb.id)
+            .eq('status', 'sent')
+            .gte('sent_at', weekStart.toISOString()),
+        ])
+
+        return {
+          id: mb.id,
+          email: mb.email,
+          company_id: (mb.company as { id: string } | null)?.id,
+          company_name: (mb.company as { name: string } | null)?.name,
+          daily_email_limit: mb.daily_email_limit,
+          weekly_email_limit: mb.weekly_email_limit,
+          sent_today: sentToday ?? 0,
+          sent_this_week: sentThisWeek ?? 0,
+        }
+      })
+    )
+
+    res.json(result)
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /admin/mailboxes/{id}/limits:
+ *   patch:
+ *     summary: Update email send limits for a mailbox (global admin only)
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [daily_email_limit, weekly_email_limit]
+ *             properties:
+ *               daily_email_limit: { type: integer, minimum: 1 }
+ *               weekly_email_limit: { type: integer, minimum: 1 }
+ *     responses:
+ *       200:
+ *         description: Updated mailbox limits
+ *       400:
+ *         description: Validation error
+ *       404:
+ *         description: Mailbox not found
+ */
+router.patch('/mailboxes/:id/limits', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid mailbox ID' })
+    return
+  }
+
+  const parsed = mailboxLimitsSchema.safeParse(req.body)
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.errors })
+    return
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('mailboxes')
+      .update({
+        daily_email_limit: parsed.data.daily_email_limit,
+        weekly_email_limit: parsed.data.weekly_email_limit,
+      })
+      .eq('id', req.params.id)
+      .select('id, email, daily_email_limit, weekly_email_limit')
+      .single()
+
+    if (error || !data) {
+      res.status(404).json({ error: error?.message ?? 'Mailbox not found' })
+      return
+    }
+
+    res.json(data)
   } catch (err) {
     next(err)
   }

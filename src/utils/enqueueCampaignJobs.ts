@@ -34,14 +34,14 @@ export async function enqueueCampaignJobs(
 
   const { data: mailboxRows } = await supabaseAdmin
     .from('mailboxes')
-    .select('id, warmup_started_at, is_paused')
+    .select('id, warmup_started_at, is_paused, daily_email_limit')
     .in('id', mailboxIds)
 
   const mailboxMap = new Map(
     (mailboxRows ?? []).map(
-      (m: { id: string; warmup_started_at: string; is_paused: boolean }) => [
+      (m: { id: string; warmup_started_at: string; is_paused: boolean; daily_email_limit: number }) => [
         m.id,
-        { warmupStartedAt: new Date(m.warmup_started_at), isPaused: m.is_paused },
+        { warmupStartedAt: new Date(m.warmup_started_at), isPaused: m.is_paused, dailyEmailLimit: m.daily_email_limit },
       ]
     )
   )
@@ -79,7 +79,7 @@ export async function enqueueCampaignJobs(
       if (sendImmediately) {
         scheduledTimes = mbLeads.map(() => new Date())
       } else {
-        const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null)
+        const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null, mbInfo?.dailyEmailLimit)
         scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
       }
 

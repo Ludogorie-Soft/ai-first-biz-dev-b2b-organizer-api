@@ -103,14 +103,25 @@ function randomGapMs(): number {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-export function getDailyLimit(warmupStartedAt: Date | null): number {
-  if (!warmupStartedAt) return 8
+/**
+ * Returns the effective daily send limit for a mailbox given its warmup start date
+ * and its configured maximum limit (admin-set target, defaults to HARD_CAP).
+ *
+ * The warmup ramp always applies:
+ *   Days  0–6:  min(8,  maxLimit)
+ *   Days  7–20: min(12, maxLimit)
+ *   Days 21+:   maxLimit  (fully warmed up)
+ *
+ * Existing callers that omit maxLimit continue to use HARD_CAP as the ceiling.
+ */
+export function getDailyLimit(warmupStartedAt: Date | null, maxLimit = HARD_CAP): number {
+  if (!warmupStartedAt) return Math.min(8, maxLimit)
   const daysSince = Math.floor(
     (Date.now() - warmupStartedAt.getTime()) / (1000 * 60 * 60 * 24)
   )
-  if (daysSince >= 21) return Math.min(18, HARD_CAP)
-  if (daysSince >= 7)  return Math.min(12, HARD_CAP)
-  return Math.min(8, HARD_CAP)
+  if (daysSince >= 21) return maxLimit
+  if (daysSince >= 7)  return Math.min(12, maxLimit)
+  return Math.min(8, maxLimit)
 }
 
 /**

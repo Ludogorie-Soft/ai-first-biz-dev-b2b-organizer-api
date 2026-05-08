@@ -5,6 +5,7 @@ import { authMiddleware } from '../middleware/auth'
 import { encrypt } from '../utils/encrypt'
 import { sesClient } from '../config/ses'
 import { SendEmailCommand } from '@aws-sdk/client-ses'
+import { getDailyLimit } from '../utils/warmup'
 
 const router = Router()
 router.use(authMiddleware)
@@ -37,14 +38,27 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
   try {
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .select('id, email, ses_status, is_paused, warmup_started_at, created_at')
+      .select('id, email, ses_status, is_paused, warmup_started_at, created_at, daily_email_limit, weekly_email_limit')
       .eq('company_id', req.user.company_id)
       .order('created_at')
     if (error) {
       res.status(400).json({ error: error.message })
       return
     }
-    res.json(data)
+
+    const result = (data ?? []).map((mb: any) => {
+      const effectiveDailyLimit = getDailyLimit(
+        mb.warmup_started_at ? new Date(mb.warmup_started_at) : null,
+        mb.daily_email_limit
+      )
+      return {
+        ...mb,
+        effective_daily_limit: effectiveDailyLimit,
+        is_warming_up: effectiveDailyLimit < mb.daily_email_limit,
+      }
+    })
+
+    res.json(result)
   } catch (err) {
     next(err)
   }

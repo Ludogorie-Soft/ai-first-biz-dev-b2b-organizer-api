@@ -56,6 +56,14 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         return
       }
 
+      const mailboxTyped = mailbox as {
+        warmup_started_at: string
+        daily_email_limit: number
+        weekly_email_limit: number
+        is_paused: boolean
+        email: string
+      }
+
       // Runtime daily limit check — safety net in case scheduler miscounted
       const todayStart = new Date()
       todayStart.setUTCHours(0, 0, 0, 0)
@@ -67,18 +75,37 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         .gte('sent_at', todayStart.toISOString())
 
       const dailyLimit = getDailyLimit(
-        (mailbox as { warmup_started_at: string }).warmup_started_at
-          ? new Date((mailbox as { warmup_started_at: string }).warmup_started_at)
-          : null
+        mailboxTyped.warmup_started_at ? new Date(mailboxTyped.warmup_started_at) : null,
+        mailboxTyped.daily_email_limit
       )
       if ((sentToday ?? 0) >= dailyLimit) {
-        // Requeue for tomorrow at working hours start
         const tomorrow = new Date()
         tomorrow.setUTCDate(tomorrow.getUTCDate() + 1)
         tomorrow.setUTCHours(9, 0, 0, 0)
         const delay = tomorrow.getTime() - Date.now()
         await emailQueue.add(job.name, job.data, { delay })
         console.log(`[Worker] Mailbox ${mailboxId} hit daily limit (${dailyLimit}) — requeued for tomorrow`)
+        return
+      }
+
+      // Weekly limit check
+      const weekStart = new Date()
+      weekStart.setUTCHours(0, 0, 0, 0)
+      weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7))
+      const { count: sentThisWeek } = await supabaseAdmin
+        .from('email_logs')
+        .select('id', { count: 'exact', head: true })
+        .eq('mailbox_id', mailboxId)
+        .eq('status', 'sent')
+        .gte('sent_at', weekStart.toISOString())
+
+      if ((sentThisWeek ?? 0) >= mailboxTyped.weekly_email_limit) {
+        const nextMonday = new Date(weekStart)
+        nextMonday.setUTCDate(nextMonday.getUTCDate() + 7)
+        nextMonday.setUTCHours(9, 0, 0, 0)
+        const delay = nextMonday.getTime() - Date.now()
+        await emailQueue.add(job.name, job.data, { delay })
+        console.log(`[Worker] Mailbox ${mailboxId} hit weekly limit (${mailboxTyped.weekly_email_limit}) — requeued for next Monday`)
         return
       }
 
@@ -98,7 +125,7 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
         .join('\n')
 
-      const mailboxEmail = (mailbox as { email: string }).email
+      const mailboxEmail = mailboxTyped.email
 
       const tokenRecord = await ensureUnsubscribeToken(
         leadId,
