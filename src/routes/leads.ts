@@ -157,6 +157,25 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const body = schema.parse(req.body)
 
+    if (body.status === 'active') {
+      const { data: existingLead, error: existingLeadErr } = await supabaseAdmin
+        .from('leads')
+        .select('status')
+        .eq('id', req.params.id)
+        .eq('company_id', req.user.company_id)
+        .single()
+
+      if (existingLeadErr || !existingLead) {
+        res.status(404).json({ error: 'Lead not found' })
+        return
+      }
+
+      if ((existingLead as { status: string }).status === 'unsubscribed') {
+        res.status(400).json({ error: 'Unsubscribed leads cannot be restored to active' })
+        return
+      }
+    }
+
     const { data, error } = await supabaseAdmin
       .from('leads')
       .update(body)
