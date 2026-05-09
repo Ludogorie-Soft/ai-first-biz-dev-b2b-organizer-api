@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express'
 import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
+import { computeCampaignListProgress, computeCampaignReplyStats } from '../utils/campaignListAggregates'
 
 const router = Router()
 router.use(authMiddleware)
@@ -32,7 +33,31 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
       res.status(400).json({ error: error.message })
       return
     }
-    res.json(data)
+
+    const rows = (data ?? []) as Record<string, unknown>[]
+    const ids = rows.map((r) => r.id as string)
+    const [progressMap, replyMap] = await Promise.all([
+      computeCampaignListProgress(ids),
+      computeCampaignReplyStats(ids),
+    ])
+
+    const enriched = rows.map((c) => {
+      const id = c.id as string
+      const p = progressMap.get(id) ?? { steps_total: 0, steps_executed: 0 }
+      const r = replyMap.get(id) ?? { total: 0, positive: 0 }
+      const leadsEmb = c.leads as { count?: number }[] | undefined
+      const contacts_count = Number(leadsEmb?.[0]?.count ?? 0)
+      return {
+        ...c,
+        contacts_count,
+        steps_executed: p.steps_executed,
+        steps_total: p.steps_total,
+        replies_count: r.total,
+        positive_replies_count: r.positive,
+      }
+    })
+
+    res.json(enriched)
   } catch (err) {
     next(err)
   }

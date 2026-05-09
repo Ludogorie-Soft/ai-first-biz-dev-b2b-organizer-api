@@ -9,6 +9,7 @@ import { emailQueue } from '../queues/emailQueue'
 import { EmailJobData } from '../types'
 import { getDailyLimit, delayMsForNextStep } from '../utils/warmup'
 import { ensureUnsubscribeToken } from '../utils/unsubscribeTokens'
+import { checkAndCompleteCampaign } from '../utils/campaignCompletion'
 
 function createEmailSenderWorker(): Worker<EmailJobData> {
   const worker = new Worker<EmailJobData>(
@@ -200,7 +201,7 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         .gt('step_order', (step as { step_order: number }).step_order)
         .order('step_order')
         .limit(1)
-        .single()
+        .maybeSingle()
 
       if (nextStep) {
         const delayMs = delayMsForNextStep(
@@ -218,6 +219,8 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
           { delay: delayMs }
         )
       }
+
+      await checkAndCompleteCampaign(campaignId)
     },
     {
       connection: redis,

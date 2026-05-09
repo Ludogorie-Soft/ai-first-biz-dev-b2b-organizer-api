@@ -3,6 +3,7 @@ import { simpleParser, ParsedMail } from 'mailparser'
 import { supabaseAdmin } from '../config/supabase'
 import { decrypt } from '../utils/encrypt'
 import { categorizeReply } from '../utils/categorizeReply'
+import { checkAndCompleteCampaign } from '../utils/campaignCompletion'
 import { Mailbox, EncryptedPayload } from '../types'
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
@@ -69,6 +70,8 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
 
         if (!logs || logs.length === 0) continue
 
+        const campaignIdsTouched = new Set<string>()
+
         const replyText: string =
           typeof parsed.text === 'string' && parsed.text.trim()
             ? parsed.text.trim()
@@ -77,7 +80,7 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
             : ''
         const category = categorizeReply(replyText)
 
-        for (const log of logs as { id: string; lead_id: string }[]) {
+        for (const log of logs as { id: string; lead_id: string; campaign_id: string }[]) {
           // Update email_log with reply category
           await supabaseAdmin
             .from('email_logs')
@@ -89,6 +92,12 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
             .from('leads')
             .update({ status: 'replied' })
             .eq('id', log.lead_id)
+
+          campaignIdsTouched.add(log.campaign_id)
+        }
+
+        for (const cid of campaignIdsTouched) {
+          await checkAndCompleteCampaign(cid)
         }
 
         console.log(`[ReplyCatcher] Reply from ${senderEmail} categorized as: ${category}`)
