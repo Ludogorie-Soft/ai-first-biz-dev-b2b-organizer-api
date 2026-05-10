@@ -7,7 +7,7 @@ import { decrypt } from '../utils/encrypt'
 import { mergeVars } from '../utils/mergeVars'
 import { emailQueue } from '../queues/emailQueue'
 import { EmailJobData } from '../types'
-import { getDailyLimit, delayMsForNextStep } from '../utils/warmup'
+import { getDailyLimit, delayMsForNextStep, msUntilNextDaySendWindow } from '../utils/warmup'
 import { ensureUnsubscribeToken } from '../utils/unsubscribeTokens'
 import { checkAndCompleteCampaign } from '../utils/campaignCompletion'
 
@@ -16,6 +16,7 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
     'email-sending',
     async (job: Job<EmailJobData>): Promise<void> => {
       const { campaignId, sequenceId, stepId, leadId, mailboxId } = job.data
+      const sendOnWeekends = job.data.sendOnWeekends === true
 
       // Fetch lead — check if still eligible to receive emails
       const { data: lead } = await supabaseAdmin
@@ -80,12 +81,9 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         mailboxTyped.daily_email_limit
       )
       if ((sentToday ?? 0) >= dailyLimit) {
-        const tomorrow = new Date()
-        tomorrow.setUTCDate(tomorrow.getUTCDate() + 1)
-        tomorrow.setUTCHours(9, 0, 0, 0)
-        const delay = tomorrow.getTime() - Date.now()
+        const delay = msUntilNextDaySendWindow(sendOnWeekends)
         await emailQueue.add(job.name, job.data, { delay })
-        console.log(`[Worker] Mailbox ${mailboxId} hit daily limit (${dailyLimit}) — requeued for tomorrow`)
+        console.log(`[Worker] Mailbox ${mailboxId} hit daily limit (${dailyLimit}) — requeued for next send window`)
         return
       }
 
@@ -205,7 +203,8 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
 
       if (nextStep) {
         const delayMs = delayMsForNextStep(
-          (nextStep as { delay_days: number }).delay_days || 1
+          (nextStep as { delay_days: number }).delay_days || 1,
+          sendOnWeekends
         )
         await emailQueue.add(
           `send-${leadId}-${sequenceId}-next`,
@@ -215,6 +214,7 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
             stepId: (nextStep as { id: string }).id,
             leadId,
             mailboxId,
+            sendOnWeekends,
           },
           { delay: delayMs }
         )

@@ -59,6 +59,8 @@ export interface EmailJobData {
   stepId: string
   leadId: string
   mailboxId: string
+  /** When true, Saturday/Sunday sends are allowed; when false, schedule only Mon–Fri (Europe/Sofia). */
+  sendOnWeekends: boolean
 }
 
 export type ReplyCategory = 'positive' | 'negative' | 'neutral' | 'out_of_office'

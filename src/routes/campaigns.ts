@@ -101,6 +101,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
       description: z.string().optional(),
       sequence_ids: z.array(z.string().uuid()).min(1),
       mailbox_ids: z.array(z.string().uuid()).min(1),
+      send_on_weekends: z.boolean().optional().default(false),
     })
     const body = schema.parse(req.body)
 
@@ -130,6 +131,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
         name: body.name,
         description: body.description,
         status: campaignStatus,
+        send_on_weekends: body.send_on_weekends,
       })
       .select()
       .single()
@@ -239,6 +241,7 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
         status: z.enum(['active', 'paused', 'completed']).optional(),
         name: z.string().min(1).optional(),
         description: z.string().optional(),
+        send_on_weekends: z.boolean().optional(),
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const body = schema.parse(req.body)

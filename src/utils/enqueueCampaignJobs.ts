@@ -17,11 +17,15 @@ export async function enqueueCampaignJobs(
 
   const { data: campaign } = await supabaseAdmin
     .from('campaigns')
-    .select('id, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
+    .select('id, send_on_weekends, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
     .eq('id', campaignId)
     .single()
 
   if (!campaign) return 0
+
+  const sendOnWeekends = Boolean(
+    (campaign as { send_on_weekends?: boolean }).send_on_weekends
+  )
 
   const sequenceIds = (campaign.campaign_sequences as { sequence_id: string }[]).map(
     (s) => s.sequence_id
@@ -80,7 +84,12 @@ export async function enqueueCampaignJobs(
         scheduledTimes = mbLeads.map(() => new Date())
       } else {
         const dailyLimit = getDailyLimit(mbInfo?.warmupStartedAt ?? null, mbInfo?.dailyEmailLimit)
-        scheduledTimes = computeScheduledTimes(mbLeads.length, dailyLimit, new Date())
+        scheduledTimes = computeScheduledTimes(
+          mbLeads.length,
+          dailyLimit,
+          new Date(),
+          sendOnWeekends
+        )
       }
 
       mbLeads.forEach((leadId, idx) => {
@@ -93,6 +102,7 @@ export async function enqueueCampaignJobs(
             stepId: (firstStep as { id: string }).id,
             leadId,
             mailboxId: mbId,
+            sendOnWeekends,
           } satisfies EmailJobData,
           opts: { delay: delayMs },
         })
