@@ -3,6 +3,7 @@ import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
 import { computeCampaignListProgress, computeCampaignReplyStats } from '../utils/campaignListAggregates'
+import { triggerNextSequenceStep } from '../utils/triggerNextSequenceStep'
 
 const router = Router()
 router.use(authMiddleware)
@@ -338,6 +339,92 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
 
     res.status(204).send()
   } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /campaigns/{id}/trigger-next-step:
+ *   post:
+ *     summary: Manually trigger the next sequence step for all active leads
+ *     tags: [Campaigns]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               force:
+ *                 type: boolean
+ *                 description: Skip delay check and send immediately
+ *     responses:
+ *       200:
+ *         description: Jobs enqueued or confirmation required
+ *       400:
+ *         description: Campaign not active or misconfigured
+ *       404:
+ *         description: Campaign not found
+ */
+router.post('/:id/trigger-next-step', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid campaign ID' })
+    return
+  }
+  try {
+    const { force } = z
+      .object({ force: z.boolean().optional().default(false) })
+      .parse(req.body)
+
+    const { data: campaign, error: campErr } = await supabaseAdmin
+      .from('campaigns')
+      .select('id, send_on_weekends, status, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .single()
+
+    if (campErr || !campaign) {
+      res.status(404).json({ error: 'Campaign not found' })
+      return
+    }
+
+    if (campaign.status !== 'active') {
+      res.status(400).json({ error: 'Campaign must be active to trigger sends' })
+      return
+    }
+
+    const sequenceIds = (campaign.campaign_sequences as { sequence_id: string }[]).map(
+      (s) => s.sequence_id
+    )
+    const mailboxIds = (campaign.campaign_mailboxes as { mailbox_id: string }[]).map(
+      (m) => m.mailbox_id
+    )
+
+    if (sequenceIds.length === 0 || mailboxIds.length === 0) {
+      res.status(400).json({ error: 'Campaign has no sequences or mailboxes configured' })
+      return
+    }
+
+    const result = await triggerNextSequenceStep(
+      req.params.id as string,
+      Boolean((campaign as { send_on_weekends?: boolean }).send_on_weekends),
+      sequenceIds,
+      mailboxIds,
+      force
+    )
+
+    res.json(result)
+  } catch (err) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: err.errors })
+      return
+    }
     next(err)
   }
 })

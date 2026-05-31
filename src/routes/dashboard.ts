@@ -141,4 +141,92 @@ router.get('/:id/stats', async (req: Request, res: Response, next: NextFunction)
   }
 })
 
+/**
+ * @swagger
+ * /campaigns/{id}/email-logs:
+ *   get:
+ *     summary: Paginated sending history for a campaign
+ *     tags: [Dashboard]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 20 }
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [sent, failed] }
+ *     responses:
+ *       200:
+ *         description: Paginated email log entries
+ */
+router.get('/:id/email-logs', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    if (!z.string().uuid().safeParse(req.params.id).success) {
+      res.status(400).json({ error: 'Invalid campaign ID' })
+      return
+    }
+    const campaignId = req.params.id as string
+
+    const querySchema = z.object({
+      page: z.coerce.number().int().min(1).default(1),
+      limit: z.coerce.number().int().min(1).max(100).default(20),
+      status: z.enum(['sent', 'failed']).optional(),
+    })
+    const { page, limit, status } = querySchema.parse(req.query)
+    const offset = (page - 1) * limit
+
+    // Verify campaign belongs to the requesting company
+    const { data: campaign, error: campErr } = await supabaseAdmin
+      .from('campaigns')
+      .select('id')
+      .eq('id', campaignId)
+      .eq('company_id', req.user.company_id)
+      .single()
+    if (campErr || !campaign) {
+      res.status(404).json({ error: 'Campaign not found' })
+      return
+    }
+
+    // Build query — join leads, sequence_steps and mailboxes for rich display
+    let query = supabaseAdmin
+      .from('email_logs')
+      .select(
+        `id,
+         status,
+         sent_subject,
+         sent_at,
+         reply_category,
+         lead:leads(id, email, first_name, last_name),
+         step:sequence_steps(step_order),
+         mailbox:mailboxes(email)`,
+        { count: 'exact' }
+      )
+      .eq('campaign_id', campaignId)
+      .order('sent_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+
+    if (status) {
+      query = query.eq('status', status)
+    }
+
+    const { data, error, count } = await query
+
+    if (error) {
+      res.status(400).json({ error: error.message })
+      return
+    }
+
+    res.json({ data: data ?? [], total: count ?? 0, page, limit })
+  } catch (err) {
+    next(err)
+  }
+})
+
 export default router

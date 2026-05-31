@@ -36,6 +36,20 @@ function createEmailSenderWorker(): Worker<EmailJobData> {
         return
       }
 
+      // Idempotency guard — skip if this exact step was already sent to this lead.
+      // Prevents double-sends when a manual trigger and the auto-scheduled delayed
+      // job both execute for the same lead+step.
+      const { count: alreadySentCount } = await supabaseAdmin
+        .from('email_logs')
+        .select('id', { count: 'exact', head: true })
+        .eq('lead_id', leadId)
+        .eq('step_id', stepId)
+        .eq('status', 'sent')
+      if ((alreadySentCount ?? 0) > 0) {
+        console.log(`[Worker] Step ${stepId} already sent to lead ${leadId} — skipping duplicate job`)
+        return
+      }
+
       // Fetch sequence step
       const { data: step } = await supabaseAdmin
         .from('sequence_steps')
