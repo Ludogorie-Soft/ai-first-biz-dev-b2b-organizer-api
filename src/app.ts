@@ -53,7 +53,11 @@ const swaggerSpec = swaggerJsdoc({
       },
     },
   },
-  apis: ['./src/routes/*.ts'],
+  apis: [
+    process.env.NODE_ENV === 'production'
+      ? './dist/src/routes/*.js'
+      : './src/routes/*.ts',
+  ],
 })
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec))
 
