@@ -2,10 +2,10 @@
   "name": "b2b-organizer-api",
   "version": "1.0.0",
   "description": "B2B Outreach Platform API",
-  "main": "dist/server.js",
+  "main": "dist/src/server.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "worker": "node dist/worker.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "test": "vitest"
