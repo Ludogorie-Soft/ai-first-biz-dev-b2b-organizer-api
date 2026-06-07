@@ -202,6 +202,8 @@ router.get('/:id/email-logs', async (req: Request, res: Response, next: NextFunc
          status,
          sent_subject,
          sent_at,
+         error_message,
+         recipient_email,
          reply_category,
          lead:leads(id, email, first_name, last_name),
          step:sequence_steps(step_order),

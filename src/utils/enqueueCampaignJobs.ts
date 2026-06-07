@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '../config/supabase'
-import { emailQueue } from '../queues/emailQueue'
+import { enqueueJobs } from '../queues/dbEmailQueue'
 import { getDailyLimit, computeScheduledTimes } from './warmup'
 import { EmailJobData } from '../types'
 
@@ -110,7 +110,7 @@ export async function enqueueCampaignJobs(
     }
 
     if (jobs.length > 0) {
-      await emailQueue.addBulk(jobs)
+      await enqueueJobs(jobs)
       totalEnqueued += jobs.length
     }
   }

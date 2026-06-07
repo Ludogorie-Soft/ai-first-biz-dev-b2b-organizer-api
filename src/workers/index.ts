@@ -1,7 +1,7 @@
-import { createEmailSenderWorker } from './emailSender'
+import { startEmailSender } from './emailSender'
 import { startReplyCatcher } from './replyCatcher'
 
-createEmailSenderWorker()
+startEmailSender()
 startReplyCatcher()
 
 console.log('[Workers] Email sender and reply catcher started')

@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '../config/supabase'
-import { emailQueue } from '../queues/emailQueue'
+import { enqueueJobs } from '../queues/dbEmailQueue'
 import { EmailJobData } from '../types'
 
 export interface TriggerConfirmationRequired {
@@ -143,8 +143,8 @@ export async function triggerNextSequenceStep(
     }
   }
 
-  // Enqueue all jobs — use a deterministic jobId so BullMQ deduplicates
-  // if the same trigger is clicked twice before any job processes.
+  // Enqueue all jobs — job_name is UNIQUE in the DB so double-triggers are
+  // deduplicated automatically via ON CONFLICT DO NOTHING (ignoreDuplicates).
   const jobs = leadsToEnqueue.map((info) => ({
     name: `trigger-${info.leadId}-${info.sequenceId}-${info.stepId}`,
     data: {
@@ -155,13 +155,10 @@ export async function triggerNextSequenceStep(
       mailboxId: info.mailboxId,
       sendOnWeekends,
     } satisfies EmailJobData,
-    opts: {
-      delay: 0,
-      jobId: `trigger-${info.leadId}-${info.sequenceId}-${info.stepId}`,
-    },
+    opts: { delay: 0 },
   }))
 
-  await emailQueue.addBulk(jobs)
+  await enqueueJobs(jobs)
 
   return { needs_confirmation: false, enqueued: jobs.length, affected_leads: leadsToEnqueue.length }
 }
