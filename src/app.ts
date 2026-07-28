@@ -6,7 +6,6 @@ import helmet from 'helmet'
 import cors from 'cors'
 import morgan from 'morgan'
 import swaggerJsdoc from 'swagger-jsdoc'
-import swaggerUi from 'swagger-ui-express'
 import { errorHandler } from './middleware/errorHandler'
 
 // Routes
@@ -31,7 +30,20 @@ const app: Application = express()
 app.set('etag', false)
 
 // Security & parsing middleware
-app.use(helmet())
+// Allow Swagger UI CDN assets (local swagger-ui-dist is not bundled on Vercel)
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'", 'https://unpkg.com'],
+        scriptSrc: ["'self'", "'unsafe-inline'", 'https://unpkg.com'],
+        imgSrc: ["'self'", 'data:', 'https://unpkg.com'],
+        connectSrc: ["'self'"],
+      },
+    },
+  })
+)
 app.use(cors())
 app.use(morgan('dev'))
 app.use(express.json())
@@ -78,7 +90,35 @@ function loadSwaggerSpec(): object {
 }
 
 const swaggerSpec = loadSwaggerSpec()
-app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec))
+
+// CDN-hosted Swagger UI — swagger-ui-express static files are missing in the
+// Vercel serverless bundle (requests returned HTML → blank /api/docs page).
+app.get('/api/docs/openapi.json', (_req: Request, res: Response) => {
+  res.json(swaggerSpec)
+})
+app.get(['/api/docs', '/api/docs/'], (_req: Request, res: Response) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>B2B Organizer API Docs</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js" crossorigin></script>
+  <script>
+    window.onload = () => {
+      window.ui = SwaggerUIBundle({
+        url: '/api/docs/openapi.json',
+        dom_id: '#swagger-ui',
+      })
+    }
+  </script>
+</body>
+</html>`)
+})
 
 // API routes
 app.use('/api/auth', authRoutes)
