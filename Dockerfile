@@ -9,6 +9,7 @@ RUN npm install
 COPY tsconfig.json ./
 COPY src ./src
 COPY worker.ts ./
+COPY scripts ./scripts
 
 RUN npm run build
 
@@ -23,7 +24,9 @@ COPY package.json ./
 RUN npm install --omit=dev
 
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/openapi.json ./openapi.json
 
 EXPOSE 3000
 
+# API-only. Run workers separately: CMD ["node", "dist/worker.js"]
 CMD ["node", "dist/src/server.js"]

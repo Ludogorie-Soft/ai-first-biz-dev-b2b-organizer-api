@@ -1,5 +1,7 @@
 import 'dotenv/config'
 import express, { Application, Request, Response } from 'express'
+import fs from 'fs'
+import path from 'path'
 import helmet from 'helmet'
 import cors from 'cors'
 import morgan from 'morgan'
@@ -37,28 +39,45 @@ app.use(express.urlencoded({ extended: true }))
 // SNS sends notifications as text/plain containing a JSON string
 app.use(express.text({ type: 'text/plain' }))
 
-// Swagger docs
-const swaggerSpec = swaggerJsdoc({
-  definition: {
-    openapi: '3.0.0',
-    info: {
-      title: 'B2B Organizer API',
-      version: '1.0.0',
-      description: 'B2B Email Outreach Platform API',
-    },
-    servers: [{ url: '/api' }],
-    components: {
-      securitySchemes: {
-        bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
-      },
+const swaggerDefinition = {
+  openapi: '3.0.0',
+  info: {
+    title: 'B2B Organizer API',
+    version: '1.0.0',
+    description: 'B2B Email Outreach Platform API',
+  },
+  servers: [{ url: '/api' }],
+  components: {
+    securitySchemes: {
+      bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
     },
   },
-  apis: [
-    process.env.NODE_ENV === 'production'
-      ? './dist/src/routes/*.js'
-      : './src/routes/*.ts',
-  ],
-})
+}
+
+function loadSwaggerSpec(): object {
+  const candidates = [
+    path.join(process.cwd(), 'openapi.json'),
+    path.join(__dirname, '..', '..', 'openapi.json'),
+    path.join(__dirname, '..', 'openapi.json'),
+  ]
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return JSON.parse(fs.readFileSync(candidate, 'utf8')) as object
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+
+  // Local/dev fallback when openapi.json has not been generated yet
+  return swaggerJsdoc({
+    definition: swaggerDefinition,
+    apis: [path.join(__dirname, 'routes', '*.ts').replace(/\\/g, '/')],
+  }) as object
+}
+
+const swaggerSpec = loadSwaggerSpec()
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec))
 
 // API routes

@@ -4,15 +4,19 @@
   "description": "B2B Outreach Platform API",
   "main": "dist/src/server.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run build:openapi",
+    "build:openapi": "node scripts/generate-openapi.js",
     "start": "node dist/src/server.js",
     "worker": "node dist/worker.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "dev": "concurrently -n api,worker -c blue,green \"npm run dev:api\" \"npm run dev:worker\"",
+    "dev:api": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "dev:worker": "ts-node-dev --respawn --transpile-only worker.ts",
     "test": "vitest"
   },
   "dependencies": {
     "@aws-sdk/client-ses": "^3.700.0",
     "@supabase/supabase-js": "^2.49.0",
+    "@vercel/node": "^5.3.6",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",

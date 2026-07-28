@@ -9,7 +9,8 @@ import { ensureUnsubscribeTokens } from '../utils/unsubscribeTokens'
 
 const router = Router()
 router.use(authMiddleware)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
+// Vercel Hobby request body limit is ~4.5MB — keep uploads under that.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } })
 
 interface ColumnMap {
   email: string | null

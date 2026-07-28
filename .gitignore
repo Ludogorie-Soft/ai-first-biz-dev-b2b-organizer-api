@@ -13,6 +13,10 @@ pnpm-debug.log*
 # Build output
 dist/
 build/
+openapi.json
+
+# Vercel
+.vercel
 
 # Logs
 logs/

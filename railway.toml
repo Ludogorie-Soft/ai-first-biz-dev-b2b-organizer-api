@@ -1,3 +1,5 @@
+# API-only process. Email sender + IMAP reply catcher must run separately
+# (e.g. `npm run worker` on an always-on laptop or a second service).
 [build]
 builder = "NIXPACKS"
 buildCommand = "npm run build"

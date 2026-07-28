@@ -1,6 +1,6 @@
 # B2B Organizer — API
 
-Backend API and worker for the B2B email outreach platform. Built with Node.js, Express, BullMQ, and Supabase.
+Backend API and worker for the B2B email outreach platform. Built with Node.js, Express, and Supabase.
 
 ---
 
@@ -8,23 +8,40 @@ Backend API and worker for the B2B email outreach platform. Built with Node.js, 
 
 The backend runs as **two separate processes**:
 
-| Process | Command | Role |
-|---|---|---|
-| API Server | `npm run dev` | Handles all HTTP requests |
-| Worker | *(started automatically with `npm run dev`)* | Sends emails via SES + catches replies via IMAP |
+| Process | Command | Where it runs | Role |
+|---|---|---|---|
+| API Server | `npm run dev:api` / Vercel | **Vercel** (serverless) or local | HTTP API, SES bounce webhook |
+| Worker | `npm run worker` / `npm run dev:worker` | **Always-on laptop** (or any long-lived host) | Sends emails via SES + catches replies via IMAP |
 
-Both processes start together when you run `npm run dev` (via `concurrently`). In production, deploy them as two separate containers.
+```mermaid
+flowchart LR
+  Frontend[Frontend]
+  VercelAPI["Vercel Express API"]
+  Supabase[(Supabase)]
+  LaptopWorker["Laptop worker"]
+  SES[AWS SES]
+  IMAP[Mailbox IMAP]
+
+  Frontend --> VercelAPI
+  VercelAPI --> Supabase
+  LaptopWorker -->|"poll email_queue every 30s"| Supabase
+  LaptopWorker --> SES
+  LaptopWorker -->|"poll INBOX every 5min"| IMAP
+  SES -->|"bounce/complaint SNS"| VercelAPI
+```
+
+**Do not run more than one worker instance** — concurrent pollers can double-claim or race on the same jobs.
 
 ---
 
 ## Tech Stack
 
 - **Runtime:** Node.js + TypeScript
-- **Framework:** Express
-- **Queue:** BullMQ + Redis Cloud
+- **Framework:** Express (wrapped for Vercel serverless)
+- **Queue:** Supabase `email_queue` table (DB-backed poller)
 - **Database & Auth:** Supabase (PostgreSQL + Auth)
 - **Email Sending:** AWS SES
-- **Reply Catching:** IMAP (imapflow)
+- **Reply Catching:** IMAP (imapflow) on the worker process
 - **Validation:** Zod
 - **API Docs:** Swagger UI (`/api/docs`)
 
@@ -68,31 +85,38 @@ supabase/migrations/013_unsubscribe_tokens.sql
 
 ### 4. Start development
 
+Run API + worker together:
+
 ```bash
 npm run dev
 ```
 
-API server: `http://localhost:3000`
+Or separately:
+
+```bash
+npm run dev:api      # http://localhost:3000 — API only
+npm run dev:worker   # email sender + IMAP reply catcher
+```
+
 Swagger docs: `http://localhost:3000/api/docs`
 
 ---
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `SUPABASE_URL` | Always | Project URL from Supabase → Settings → Data API, e.g. `https://your-project-ref.supabase.co` |
-| `SUPABASE_SERVICE_ROLE_KEY` | Always | Service role key (bypasses RLS — keep secret) |
-| `REDIS_URL` | Always | Redis Cloud / Upstash URL, e.g. `rediss://default:password@host:port` |
-| `FRONTEND_URL` | Always | Base URL of the frontend app — used in invitation & admin notification emails, e.g. `http://localhost:3001` |
-| `API_URL` | Always | Public base URL of this API — used in `List-Unsubscribe` email headers (RFC 8058), e.g. `http://localhost:3000` |
-| `AWS_ACCESS_KEY_ID` | Worker only | AWS IAM key — create an IAM user with `AmazonSESFullAccess` |
-| `AWS_SECRET_ACCESS_KEY` | Worker only | AWS IAM secret — shown once at creation |
-| `AWS_REGION` | Worker only | SES region where your sending identity is verified, e.g. `eu-west-1` |
-| `SES_FROM_EMAIL` | Worker only | Verified sender email in AWS SES |
-| `SES_WEBHOOK_SECRET` | Worker only | Random string to protect the bounce webhook URL |
-| `IMAP_ENCRYPTION_KEY` | Worker only | 64 hex characters (32 random bytes) |
-| `PORT` | Optional | Defaults to `3000` |
+| Variable | API / Vercel | Worker | Description |
+|---|---|---|---|
+| `SUPABASE_URL` | Required | Required | Project URL from Supabase → Settings → Data API |
+| `SUPABASE_SERVICE_ROLE_KEY` | Required | Required | Service role key (bypasses RLS — keep secret) |
+| `FRONTEND_URL` | Required | Required | Frontend base URL (invites, verification, unsubscribe links) |
+| `API_URL` | Required | Required | Public API base URL (`List-Unsubscribe` headers). On Vercel: `https://your-project.vercel.app` |
+| `AWS_ACCESS_KEY_ID` | Required | Required | IAM key with SES access |
+| `AWS_SECRET_ACCESS_KEY` | Required | Required | IAM secret |
+| `AWS_REGION` | Required | Required | SES region, e.g. `eu-west-1` |
+| `SES_FROM_EMAIL` | Required | — | Verified SES identity for **system** mail (invites, etc.). Campaigns use `mailbox.email` |
+| `SES_WEBHOOK_SECRET` | Required | — | Protects `POST /webhooks/ses` |
+| `IMAP_ENCRYPTION_KEY` | Required | Required | 64 hex chars — encrypt IMAP passwords on create / decrypt on worker |
+| `PORT` | Optional | — | Local API only (default `3000`). Not used on Vercel |
 
 Generate the encryption key:
 ```bash
@@ -103,6 +127,82 @@ Generate the webhook secret:
 ```bash
 node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
 ```
+
+---
+
+## Deploy API on Vercel (Hobby)
+
+1. Push this repo and import the project in Vercel.
+2. Set the **API / Vercel** env vars from the table above (including `SES_FROM_EMAIL` and `SES_WEBHOOK_SECRET`).
+3. Deploy. Confirm:
+   - `GET https://your-project.vercel.app/health` → `{ "status": "ok" }`
+   - `GET https://your-project.vercel.app/api/docs` → Swagger UI
+4. Set `API_URL` to your Vercel URL (and `FRONTEND_URL` to the frontend).
+5. Point AWS SNS bounce/complaint subscription to:
+   `https://your-project.vercel.app/webhooks/ses?token=YOUR_SES_WEBHOOK_SECRET`
+
+**Lead import size:** Vercel Hobby request bodies are limited to ~4.5 MB. Excel uploads are capped at **4 MB** in multer.
+
+The Vercel function must **not** run workers — only `api/index.ts` exports the Express app.
+
+---
+
+## Laptop worker (email sender + IMAP)
+
+Campaign sending and reply catching need a long-lived Node process. Run it on an always-on laptop (or any always-on machine).
+
+### Setup
+
+```bash
+git clone <this-repo>
+cd ai-first-biz-dev-b2b-organizer-api
+npm install
+cp .env.example .env   # same Supabase / AWS / IMAP / URL values as production
+npm run build
+npm run worker
+```
+
+The worker only needs **outbound** network access (Supabase, SES, IMAP). No public URL or tunnel.
+
+### Keep it running (Mac)
+
+1. **Prevent sleep while plugged in**
+   - System Settings → **Lock Screen** (or **Energy** / **Battery** on older macOS) → set **Turn display off on power adapter when inactive** to **Never** (or a long interval).
+   - Optional (keeps the Mac awake even with the lid closed on many models when on AC + external display, or use `caffeinate`):
+     ```bash
+     # Keep the system awake while the worker runs (run in a separate terminal, or wrap pm2)
+     caffeinate -dimsu &
+     ```
+2. **Auto-start on login** with **pm2**:
+   ```bash
+   npm install -g pm2
+   cd /path/to/ai-first-biz-dev-b2b-organizer-api
+   npm run build
+   pm2 start dist/worker.js --name b2b-worker
+   pm2 save
+   pm2 startup   # prints a sudo command — run it so pm2 restores on reboot
+   ```
+   Useful commands: `pm2 status`, `pm2 logs b2b-worker`, `pm2 restart b2b-worker`.
+3. Run **exactly one** worker instance. Stopping Railway/old API workers first avoids double-sends.
+
+### Smoke test
+
+1. Create a campaign in the UI (API on Vercel).
+2. Confirm a row appears in Supabase `email_queue`.
+3. Laptop worker logs a send via SES.
+4. Reply to the campaign email from the lead address.
+5. Within ~5 minutes, worker IMAP poll marks the lead `replied`.
+
+---
+
+## Cutover checklist (Railway → Vercel + laptop)
+
+1. Deploy API to Vercel; set env vars; confirm `/health` and `/api/docs`.
+2. Update SNS bounce webhook URL to the Vercel `/webhooks/ses?token=...` endpoint.
+3. Set production `API_URL` / `FRONTEND_URL`.
+4. Start `npm run worker` on the always-on laptop (process manager + no sleep).
+5. Smoke-test send + IMAP reply (above).
+6. Stop the old Railway (or Docker) API process so it no longer runs embedded workers — or keep Railway only as a cold backup with workers disabled.
 
 ---
 
@@ -155,7 +255,7 @@ Full interactive docs at `/api/docs`. Summary:
 | `GET` | `/api/leads` | List leads (`?target_group_id=`, `?page=`, `?limit=`) |
 | `PATCH` | `/api/leads/:id` | Update lead status or notes |
 | `POST` | `/api/leads/preview` | Parse an Excel file and return its column headers |
-| `POST` | `/api/leads/import` | Import leads from `.xlsx` file |
+| `POST` | `/api/leads/import` | Import leads from `.xlsx` file (max **4 MB** on Vercel) |
 
 ### Sequences
 | Method | Path | Description |
@@ -198,7 +298,7 @@ Full interactive docs at `/api/docs`. Summary:
 ## How the Worker Works
 
 ### Email Sender
-Listens to the BullMQ `email-sending` queue. When `POST /api/campaigns` is called, jobs are created per lead with scheduled delays. For each job the worker:
+Polls the DB `email_queue` every 30 seconds. When `POST /api/campaigns` is called, jobs are created per lead with scheduled delays. For each job the worker:
 
 1. Checks if the mailbox is paused — skips if true
 2. Checks today's send count against the daily limit — requeues for tomorrow if exceeded
@@ -211,12 +311,12 @@ Listens to the BullMQ `email-sending` queue. When `POST /api/campaigns` is calle
 9. If there is a next sequence step, schedules it at a random time within working hours on the target day
 
 ### Reply Catcher
-Polls every 5 minutes. For each mailbox:
+Polls every 5 minutes (on the **worker** process only). For each mailbox:
 
 1. Connects via IMAP and reads unseen emails from the last 24 hours
 2. Matches the sender email against leads that were previously contacted
 3. Categorizes the reply body using keyword matching (supports English and Bulgarian):
-   - **Positive:** interest, yes, sure, schedule, when, интересувам се, да, добре, etc.
+   - **Positive:** interest, yes, sure, schedule, when, интересувам се, да, удобно, etc.
    - **Negative:** not interested, no thanks, remove, не ме интересува, не благодаря, etc.
    - **Out of office:** vacation, out of office, отсъствам, ваканция, etc.
    - **Neutral:** fallback if no keywords match
@@ -241,8 +341,8 @@ If a mailbox's hard bounce rate exceeds **5%** over the last 30 days, it is auto
 ### SES Webhook Setup (AWS)
 1. SNS → **Create topic** (Standard) → note the ARN
 2. SES → your verified identity → **Notifications** → assign the SNS topic for **Bounces** and **Complaints**
-3. Add `SES_WEBHOOK_SECRET` to your `.env`
-4. SNS → **Subscriptions** → HTTPS → URL: `https://your-api.com/webhooks/ses?token=YOUR_SECRET`
+3. Add `SES_WEBHOOK_SECRET` to your `.env` / Vercel env
+4. SNS → **Subscriptions** → HTTPS → URL: `https://your-api.vercel.app/webhooks/ses?token=YOUR_SECRET`
 5. The first request is a `SubscriptionConfirmation` — the handler auto-confirms it
 
 ---
@@ -304,24 +404,22 @@ The platform uses an **invite** model with multi-company support:
 
 ---
 
-## Production Deployment
+## Production Deployment (Docker alternative)
 
-Deploy as two separate Docker containers from the same image:
+If not using Vercel, deploy as two separate processes from the same image:
 
 ```dockerfile
-# API container
-CMD ["node", "dist/server.js"]
+# API container (HTTP only — no embedded workers)
+CMD ["node", "dist/src/server.js"]
 
-# Worker container
+# Worker container (email sender + IMAP)
 CMD ["node", "dist/worker.js"]
 ```
 
 Build:
 ```bash
-npm run build   # outputs to dist/
+npm run build   # outputs to dist/ + openapi.json
 ```
-
-Both containers need the same `.env` values. The worker additionally requires the AWS keys, `SES_WEBHOOK_SECRET`, and `IMAP_ENCRYPTION_KEY`.
 
 ---
 

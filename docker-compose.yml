@@ -1,8 +1,17 @@
 services:
   api:
     image: ludogoriesoft/b2b-organizer-api:latest
+    # HTTP only — workers are a separate service
+    command: ["node", "dist/src/server.js"]
     ports:
       - "3000:3000"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  worker:
+    image: ludogoriesoft/b2b-organizer-api:latest
+    command: ["node", "dist/worker.js"]
     env_file:
       - .env
     restart: unless-stopped
