@@ -1,0 +1,15 @@
+---
+description: Deployment and platform constraints for this API project
+alwaysApply: true
+---
+
+# Deployment
+
+This API project is deployed on a **free (Hobby) Vercel** account.
+
+## Implications for changes
+
+- Prefer CommonJS-compatible dependencies (`require()`). Avoid ESM-only packages that break Vercel serverless (`ERR_REQUIRE_ESM`), as happened with `sanitize-html` / `htmlparser2`.
+- Keep request body / upload sizes under Vercel Hobby limits (~**4.5 MB**). Existing multer uploads use a **4 MB** cap for this reason.
+- Serverless functions have short execution time limits on Hobby; avoid long-running work in HTTP handlers. Background email sending belongs in the separate worker process, not the Vercel request path.
+- Do not assume persistent local disk or long-lived in-memory state across requests.
