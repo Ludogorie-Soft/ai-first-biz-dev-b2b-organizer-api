@@ -6,6 +6,7 @@ import { encrypt } from '../utils/encrypt'
 import { sesClient } from '../config/ses'
 import { SendEmailCommand } from '@aws-sdk/client-ses'
 import { getDailyLimit } from '../utils/warmup'
+import { sanitizeEmailBody } from '../utils/emailHtml'
 
 const router = Router()
 router.use(authMiddleware)
@@ -23,6 +24,9 @@ const mailboxSchema = z.object({
   imap_config: imapConfigSchema,
 })
 
+const MAILBOX_LIST_FIELDS =
+  'id, email, ses_status, is_paused, warmup_started_at, created_at, daily_email_limit, weekly_email_limit, signature'
+
 /**
  * @swagger
  * /mailboxes:
@@ -38,7 +42,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
   try {
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .select('id, email, ses_status, is_paused, warmup_started_at, created_at, daily_email_limit, weekly_email_limit')
+      .select(MAILBOX_LIST_FIELDS)
       .eq('company_id', req.user.company_id)
       .order('created_at')
     if (error) {
@@ -100,14 +104,13 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
       .insert({ company_id: req.user.company_id, email: body.email, imap_config: encryptedConfig, ses_status: 'pending' })
-      .select('id, email, ses_status, created_at')
+      .select('id, email, ses_status, created_at, signature')
       .single()
     if (error) {
       res.status(400).json({ error: error.message })
       return
     }
 
-    // Notify all global admins about the new pending mailbox
     notifyAdminsNewMailbox(body.email, req.user.company_id).catch((e: Error) =>
       console.error('[Mailboxes] Failed to notify admins:', e.message)
     )
@@ -123,14 +126,12 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
 })
 
 async function notifyAdminsNewMailbox(mailboxEmail: string, companyId: string): Promise<void> {
-  // Get company name
   const { data: company } = await supabaseAdmin
     .from('companies')
     .select('name')
     .eq('id', companyId)
     .single()
 
-  // Get all global admins
   const { data: admins } = await supabaseAdmin
     .from('users')
     .select('email')
@@ -173,6 +174,82 @@ async function notifyAdminsNewMailbox(mailboxEmail: string, companyId: string): 
     },
   }))
 }
+
+/**
+ * @swagger
+ * /mailboxes/{id}:
+ *   patch:
+ *     summary: Update mailbox signature
+ *     tags: [Mailboxes]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               signature: { type: string, nullable: true }
+ *     responses:
+ *       200:
+ *         description: Updated mailbox
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Not found
+ */
+router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid mailbox ID' })
+    return
+  }
+  if (!['owner', 'admin', 'global_admin'].includes(req.user.role)) {
+    res.status(403).json({ error: 'Only owners and admins can update mailboxes' })
+    return
+  }
+  try {
+    const schema = z
+      .object({
+        signature: z.string().nullable().optional(),
+      })
+      .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
+    const parsed = schema.parse(req.body)
+
+    const updates: { signature?: string | null } = {}
+    if (parsed.signature !== undefined) {
+      if (parsed.signature === null || parsed.signature.trim() === '') {
+        updates.signature = null
+      } else {
+        const cleaned = sanitizeEmailBody(parsed.signature)
+        updates.signature = cleaned || null
+      }
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('mailboxes')
+      .update(updates)
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .select(MAILBOX_LIST_FIELDS)
+      .single()
+    if (error || !data) {
+      res.status(404).json({ error: 'Mailbox not found' })
+      return
+    }
+    res.json(data)
+  } catch (err) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: err.errors })
+      return
+    }
+    next(err)
+  }
+})
 
 /**
  * @swagger

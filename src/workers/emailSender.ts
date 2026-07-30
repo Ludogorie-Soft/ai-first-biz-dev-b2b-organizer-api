@@ -1,7 +1,10 @@
-import { SendEmailCommand } from '@aws-sdk/client-ses'
+import { SendEmailCommand, SendRawEmailCommand } from '@aws-sdk/client-ses'
+import MailComposer from 'nodemailer/lib/mail-composer'
 import { sesClient } from '../config/ses'
 import { supabaseAdmin } from '../config/supabase'
 import { mergeVars } from '../utils/mergeVars'
+import { looksLikeHtml } from '../utils/emailHtml'
+import { ATTACHMENT_BUCKET } from '../utils/attachments'
 import { getDailyLimit, delayMsForNextStep, msUntilNextDaySendWindow } from '../utils/warmup'
 import { ensureUnsubscribeToken } from '../utils/unsubscribeTokens'
 import { checkAndCompleteCampaign } from '../utils/campaignCompletion'
@@ -18,6 +21,82 @@ import {
 const POLL_INTERVAL_MS = 30_000
 const BATCH_SIZE = 5
 const MAX_ATTEMPTS = 3
+
+interface StepAttachmentRow {
+  id: string
+  file_name: string
+  content_type: string
+  size_bytes: number
+  storage_path: string
+}
+
+interface DownloadedAttachment {
+  filename: string
+  contentType: string
+  content: Buffer
+}
+
+async function loadStepAttachments(stepId: string): Promise<DownloadedAttachment[]> {
+  const { data: rows, error } = await supabaseAdmin
+    .from('sequence_step_attachments')
+    .select('id, file_name, content_type, size_bytes, storage_path')
+    .eq('step_id', stepId)
+  if (error) throw new Error(`Failed to load attachments: ${error.message}`)
+  if (!rows || rows.length === 0) return []
+
+  const files: DownloadedAttachment[] = []
+  for (const row of rows as StepAttachmentRow[]) {
+    const { data, error: downloadError } = await supabaseAdmin.storage
+      .from(ATTACHMENT_BUCKET)
+      .download(row.storage_path)
+    if (downloadError || !data) {
+      throw new Error(`Failed to download attachment ${row.file_name}: ${downloadError?.message || 'missing'}`)
+    }
+    const buffer = Buffer.from(await data.arrayBuffer())
+    files.push({
+      filename: row.file_name,
+      contentType: row.content_type,
+      content: buffer,
+    })
+  }
+  return files
+}
+
+async function sendWithAttachments(params: {
+  from: string
+  to: string
+  subject: string
+  html: string
+  listUnsubscribeUrl: string
+  attachments: DownloadedAttachment[]
+}): Promise<void> {
+  const mail = new MailComposer({
+    from: params.from,
+    replyTo: params.from,
+    to: params.to,
+    subject: params.subject,
+    html: params.html,
+    attachments: params.attachments.map((a) => ({
+      filename: a.filename,
+      content: a.content,
+      contentType: a.contentType,
+    })),
+    headers: {
+      'List-Unsubscribe': `<${params.listUnsubscribeUrl}>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    },
+  })
+
+  const rawMessage = await mail.compile().build()
+
+  await sesClient.send(
+    new SendRawEmailCommand({
+      Source: params.from,
+      Destinations: [params.to],
+      RawMessage: { Data: rawMessage },
+    })
+  )
+}
 
 async function processEmailJob(job: EmailQueueRow): Promise<void> {
   const campaignId    = job.campaign_id
@@ -62,7 +141,7 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
   // Fetch sequence step
   const { data: step } = await supabaseAdmin
     .from('sequence_steps')
-    .select('*, sequences(id)')
+    .select('*, sequences(id, include_signature)')
     .eq('id', stepId)
     .single()
   if (!step) throw new Error(`Step ${stepId} not found`)
@@ -87,7 +166,11 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
     weekly_email_limit: number
     is_paused: boolean
     email: string
+    signature: string | null
   }
+
+  const includeSignature =
+    (step as { sequences?: { include_signature?: boolean } | null }).sequences?.include_signature !== false
 
   // Runtime daily limit check
   const todayStart = new Date()
@@ -138,14 +221,17 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
   )
   const body = mergeVars(
     (step as { body: string }).body,
-    lead as { first_name: string | null; last_name: string | null; email: string; company_name: string | null; position: string | null }
+    lead as { first_name: string | null; last_name: string | null; email: string; company_name: string | null; position: string | null },
+    { html: true }
   )
 
-  // Convert plain text body to HTML
-  const htmlBody = body
-    .split(/\n\n+/)
-    .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
-    .join('\n')
+  // Rich-text steps already store HTML; legacy plain-text steps still need conversion
+  const htmlBody = looksLikeHtml(body)
+    ? body
+    : body
+        .split(/\n\n+/)
+        .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
+        .join('\n')
 
   const mailboxEmail = mailboxTyped.email
 
@@ -163,7 +249,27 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
     `<a href="${unsubscribeUrl}" style="color:#94a3b8">Unsubscribe</a></p>`
 
   const apiUnsubscribeUrl = `${process.env.API_URL}/api/unsubscribe?token=${tokenRecord.token}`
-  const emailHtml = htmlBody + unsubscribeBlock
+
+  const leadFields = lead as {
+    first_name: string | null
+    last_name: string | null
+    email: string
+    company_name: string | null
+    position: string | null
+  }
+
+  let signatureHtml = ''
+  if (includeSignature && mailboxTyped.signature?.trim()) {
+    const mergedSignature = mergeVars(mailboxTyped.signature, leadFields, { html: true })
+    signatureHtml = looksLikeHtml(mergedSignature)
+      ? `\n<div style="margin-top:24px">${mergedSignature}</div>`
+      : `\n<div style="margin-top:24px">${mergedSignature
+          .split(/\n\n+/)
+          .map((para) => `<p>${para.replace(/\n/g, '<br>')}</p>`)
+          .join('\n')}</div>`
+  }
+
+  const emailHtml = htmlBody + signatureHtml + unsubscribeBlock
 
   console.log(
     `[EmailSender pid=${process.pid}] Prepared email HTML for job ${job.id}, lead ${leadId}: ` +
@@ -174,6 +280,8 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
     throw new Error(`Unsubscribe link missing from rendered HTML for lead ${leadId}`)
   }
 
+  const attachments = await loadStepAttachments(stepId)
+
   const primaryEmail = (lead as { email: string }).email
   const officeEmailRaw = (lead as { office_email?: string | null }).office_email?.trim() || null
   const officeEmail = officeEmailRaw && officeEmailRaw.toLowerCase() !== primaryEmail.trim().toLowerCase()
@@ -181,23 +289,34 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
     : null
 
   const sendSingleEmail = async (toAddress: string) => {
-    await sesClient.send(
-      new SendEmailCommand({
-        Source: mailboxEmail,
-        ReplyToAddresses: [mailboxEmail],
-        Destination: { ToAddresses: [toAddress] },
-        Message: {
-          Subject: { Data: subject, Charset: 'UTF-8' },
-          Body: { Html: { Data: emailHtml, Charset: 'UTF-8' } },
-        },
-        ...({
-          Headers: [
-            { Name: 'List-Unsubscribe', Value: `<${apiUnsubscribeUrl}>` },
-            { Name: 'List-Unsubscribe-Post', Value: 'List-Unsubscribe=One-Click' },
-          ],
-        } as Record<string, unknown>),
+    if (attachments.length > 0) {
+      await sendWithAttachments({
+        from: mailboxEmail,
+        to: toAddress,
+        subject,
+        html: emailHtml,
+        listUnsubscribeUrl: apiUnsubscribeUrl,
+        attachments,
       })
-    )
+    } else {
+      await sesClient.send(
+        new SendEmailCommand({
+          Source: mailboxEmail,
+          ReplyToAddresses: [mailboxEmail],
+          Destination: { ToAddresses: [toAddress] },
+          Message: {
+            Subject: { Data: subject, Charset: 'UTF-8' },
+            Body: { Html: { Data: emailHtml, Charset: 'UTF-8' } },
+          },
+          ...({
+            Headers: [
+              { Name: 'List-Unsubscribe', Value: `<${apiUnsubscribeUrl}>` },
+              { Name: 'List-Unsubscribe-Post', Value: 'List-Unsubscribe=One-Click' },
+            ],
+          } as Record<string, unknown>),
+        })
+      )
+    }
     await supabaseAdmin.from('email_logs').insert({
       campaign_id: campaignId,
       sequence_id: sequenceId,

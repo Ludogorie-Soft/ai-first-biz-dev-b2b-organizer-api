@@ -30,12 +30,23 @@ export interface SequenceStep {
   created_at: string
 }
 
+export interface SequenceStepAttachment {
+  id: string
+  step_id: string
+  file_name: string
+  content_type: string
+  size_bytes: number
+  storage_path: string
+  created_at: string
+}
+
 export interface Mailbox {
   id: string
   company_id: string
   email: string
   imap_config: EncryptedPayload | null
   ses_status: 'pending' | 'active'
+  signature: string | null
   created_at: string
 }
 
