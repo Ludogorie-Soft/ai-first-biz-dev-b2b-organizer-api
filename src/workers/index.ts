@@ -1,3 +1,4 @@
+import '../utils/timestampConsole'
 import { startEmailSender } from './emailSender'
 import { startReplyCatcher } from './replyCatcher'
 

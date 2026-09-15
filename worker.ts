@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import './src/utils/timestampConsole'
 import { validateEnv } from './src/config/env'
 validateEnv('worker')
 
