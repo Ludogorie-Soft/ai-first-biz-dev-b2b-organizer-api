@@ -8,12 +8,15 @@ import { SendEmailCommand } from '@aws-sdk/client-ses'
 const router = Router()
 
 async function sendVerificationEmail(userId: string, email: string): Promise<void> {
-  const { data: verification } = await supabaseAdmin
+  const { data: verification, error } = await supabaseAdmin
     .from('email_verifications')
     .insert({ user_id: userId })
     .select('token')
     .single()
-  if (!verification) return
+  if (!verification) {
+    console.error('[Auth] Failed to create verification token:', error?.message)
+    return
+  }
   const verifyUrl = `${process.env.FRONTEND_URL}/verify-email?token=${verification.token}`
   await sesClient.send(new SendEmailCommand({
     Source: process.env.SES_FROM_EMAIL!,
@@ -35,7 +38,9 @@ async function sendVerificationEmail(userId: string, email: string): Promise<voi
         },
       },
     },
-  })).catch((e: Error) => console.error('[Auth] Failed to send verification email:', e.message))
+  }))
+    .then((r) => console.log('[Auth] Verification email accepted by SES, MessageId:', r.MessageId))
+    .catch((e: Error) => console.error('[Auth] Failed to send verification email:', e.name, e.message))
 }
 
 const registerSchema = z.object({
