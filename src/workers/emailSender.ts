@@ -4,6 +4,7 @@ import { sesClient } from '../config/ses'
 import { supabaseAdmin } from '../config/supabase'
 import { mergeVars } from '../utils/mergeVars'
 import { looksLikeHtml } from '../utils/emailHtml'
+import { appendToStyledEmail, styledHtmlToText } from '../utils/emailTemplate'
 import { ATTACHMENT_BUCKET } from '../utils/attachments'
 import { getDailyLimit, delayMsForNextStep, msUntilNextDaySendWindow } from '../utils/warmup'
 import { ensureUnsubscribeToken } from '../utils/unsubscribeTokens'
@@ -269,7 +270,13 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
           .join('\n')}</div>`
   }
 
-  const emailHtml = htmlBody + signatureHtml + unsubscribeBlock
+  const stepTemplate = step as { use_template?: boolean; styled_html?: string | null }
+  const styledSource = stepTemplate.use_template ? stepTemplate.styled_html : null
+  const styledHtml = styledSource ? mergeVars(styledSource, leadFields, { html: true }) : null
+
+  const emailHtml = styledHtml
+    ? appendToStyledEmail(styledHtml, signatureHtml + unsubscribeBlock)
+    : htmlBody + signatureHtml + unsubscribeBlock
 
   console.log(
     `[EmailSender pid=${process.pid}] Prepared email HTML for job ${job.id}, lead ${leadId}: ` +
@@ -325,7 +332,7 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
       mailbox_id: mailboxId,
       status: 'sent',
       sent_subject: subject,
-      sent_body: body,
+      sent_body: styledHtml ? styledHtmlToText(styledHtml) : body,
       sent_at: new Date().toISOString(),
       recipient_email: toAddress,
     })

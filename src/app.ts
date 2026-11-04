@@ -46,7 +46,8 @@ app.use(
 )
 app.use(cors())
 app.use(morgan('dev'))
-app.use(express.json())
+// Raised from the 100 KB default: styled email templates are saved as JSON
+app.use(express.json({ limit: '256kb' }))
 app.use(express.urlencoded({ extended: true }))
 // SNS sends notifications as text/plain containing a JSON string
 app.use(express.text({ type: 'text/plain' }))

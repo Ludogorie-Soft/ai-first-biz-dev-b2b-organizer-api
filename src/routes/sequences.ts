@@ -14,6 +14,12 @@ import {
   resolveContentType,
   sanitizeFileName,
 } from '../utils/attachments'
+import {
+  TEMPLATE_EXTENSIONS,
+  extractTemplateHtml,
+  prepareStyledHtml,
+  styledHtmlToBody,
+} from '../utils/emailTemplate'
 
 const router = Router()
 router.use(authMiddleware)
@@ -115,12 +121,14 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
  *         application/json:
  *           schema:
  *             type: object
- *             required: [step_order, subject, body]
+ *             required: [step_order, subject]
  *             properties:
  *               step_order: { type: integer }
  *               subject: { type: string }
- *               body: { type: string }
+ *               body: { type: string, description: Required unless use_template is true }
  *               delay_days: { type: integer, default: 0 }
+ *               use_template: { type: boolean, description: Send styled_html instead of body }
+ *               styled_html: { type: string, description: Required when use_template is true }
  *     responses:
  *       201:
  *         description: Step created
@@ -132,11 +140,33 @@ router.post('/:id/steps', async (req: Request, res: Response, next: NextFunction
     const schema = z.object({
       step_order: z.number().int().positive(),
       subject: z.string().min(1),
-      body: z.string().min(1),
+      body: z.string().min(1).optional(),
       delay_days: z.number().int().min(0).default(0),
+      use_template: z.boolean().default(false),
+      styled_html: z.string().min(1).optional(),
     })
     const parsed = schema.parse(req.body)
-    const body = { ...parsed, body: sanitizeEmailBody(parsed.body) }
+
+    if (parsed.use_template && parsed.styled_html === undefined) {
+      res.status(400).json({ error: 'styled_html is required when use_template is true' })
+      return
+    }
+    let styledHtml: string | undefined
+    if (parsed.styled_html !== undefined) {
+      const prepared = prepareStyledHtml(parsed.styled_html)
+      if ('error' in prepared) {
+        res.status(400).json({ error: prepared.error })
+        return
+      }
+      styledHtml = prepared.html
+    }
+
+    const sanitizedBody = parsed.body !== undefined ? sanitizeEmailBody(parsed.body) : ''
+    const body = {
+      ...parsed,
+      styled_html: styledHtml,
+      body: sanitizedBody || (parsed.use_template ? styledHtmlToBody(styledHtml!) : ''),
+    }
     if (!body.body) {
       res.status(400).json({ error: 'Body is required' })
       return
@@ -235,6 +265,7 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction): Prom
  *             properties:
  *               name: { type: string }
  *               include_signature: { type: boolean }
+ *               template_html: { type: string, description: Edited template HTML }
  *     responses:
  *       200:
  *         description: Updated sequence
@@ -251,9 +282,19 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
       .object({
         name: z.string().min(1).optional(),
         include_signature: z.boolean().optional(),
+        template_html: z.string().min(1).optional(),
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const body = schema.parse(req.body)
+
+    if (body.template_html !== undefined) {
+      const prepared = prepareStyledHtml(body.template_html)
+      if ('error' in prepared) {
+        res.status(400).json({ error: prepared.error })
+        return
+      }
+      body.template_html = prepared.html
+    }
 
     const { data, error } = await supabaseAdmin
       .from('sequences')
@@ -341,6 +382,143 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
 
 /**
  * @swagger
+ * /sequences/{id}/template:
+ *   post:
+ *     summary: Upload the sequence's styled email template (HTML or EML)
+ *     tags: [Sequences]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [file]
+ *             properties:
+ *               file: { type: string, format: binary }
+ *     responses:
+ *       200:
+ *         description: Updated sequence, plus warnings about content removed from the file
+ *       400:
+ *         description: Validation error
+ *       404:
+ *         description: Sequence not found
+ */
+router.post(
+  '/:id/template',
+  (req: Request, res: Response, next: NextFunction) => {
+    upload.single('file')(req, res, (err: unknown) => {
+      if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+        res.status(400).json({ error: 'File exceeds 4 MB limit' })
+        return
+      }
+      if (err) {
+        next(err)
+        return
+      }
+      next()
+    })
+  },
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if (!z.string().uuid().safeParse(req.params.id).success) {
+      res.status(400).json({ error: 'Invalid sequence ID' })
+      return
+    }
+    try {
+      const file = req.file
+      if (!file) {
+        res.status(400).json({ error: 'File is required' })
+        return
+      }
+      const extension = file.originalname.split('.').pop()?.toLowerCase() || ''
+      if (!TEMPLATE_EXTENSIONS.includes(extension)) {
+        res.status(400).json({ error: 'File type not allowed. Use HTML or EML' })
+        return
+      }
+
+      let rawHtml: string
+      try {
+        rawHtml = await extractTemplateHtml(file.originalname, file.buffer)
+      } catch (err) {
+        res.status(400).json({ error: (err as Error).message })
+        return
+      }
+
+      const prepared = prepareStyledHtml(rawHtml)
+      if ('error' in prepared) {
+        res.status(400).json({ error: prepared.error })
+        return
+      }
+
+      const { data, error } = await supabaseAdmin
+        .from('sequences')
+        .update({
+          template_html: prepared.html,
+          template_file_name: sanitizeFileName(file.originalname),
+        })
+        .eq('id', req.params.id)
+        .eq('company_id', req.user.company_id)
+        .select()
+        .single()
+      if (error || !data) {
+        res.status(404).json({ error: 'Sequence not found' })
+        return
+      }
+      res.json({ ...data, warnings: prepared.warnings })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * @swagger
+ * /sequences/{id}/template:
+ *   delete:
+ *     summary: Remove the sequence's styled template. Steps keep their own copies.
+ *     tags: [Sequences]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       204:
+ *         description: Removed
+ *       404:
+ *         description: Sequence not found
+ */
+router.delete('/:id/template', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid sequence ID' })
+    return
+  }
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('sequences')
+      .update({ template_html: null, template_file_name: null })
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .select('id')
+      .single()
+    if (error || !data) {
+      res.status(404).json({ error: 'Sequence not found' })
+      return
+    }
+    res.status(204).send()
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
  * /sequences/{id}/steps/{stepId}:
  *   patch:
  *     summary: Update a sequence step
@@ -366,6 +544,8 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
  *               body: { type: string }
  *               delay_days: { type: integer }
  *               step_order: { type: integer }
+ *               use_template: { type: boolean, description: Send styled_html instead of body }
+ *               styled_html: { type: string, description: Required when use_template is true }
  *     responses:
  *       200:
  *         description: Updated step
@@ -385,16 +565,30 @@ router.patch('/:id/steps/:stepId', async (req: Request, res: Response, next: Nex
         body: z.string().min(1).optional(),
         delay_days: z.number().int().min(0).optional(),
         step_order: z.number().int().positive().optional(),
+        use_template: z.boolean().optional(),
+        styled_html: z.string().min(1).optional(),
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const parsed = schema.parse(req.body)
     const body =
       parsed.body !== undefined
         ? { ...parsed, body: sanitizeEmailBody(parsed.body) }
-        : parsed
+        : { ...parsed }
     if (parsed.body !== undefined && !body.body) {
       res.status(400).json({ error: 'Body is required' })
       return
+    }
+    if (parsed.use_template && parsed.styled_html === undefined) {
+      res.status(400).json({ error: 'styled_html is required when use_template is true' })
+      return
+    }
+    if (parsed.styled_html !== undefined) {
+      const prepared = prepareStyledHtml(parsed.styled_html)
+      if ('error' in prepared) {
+        res.status(400).json({ error: prepared.error })
+        return
+      }
+      body.styled_html = prepared.html
     }
 
     // Verify sequence belongs to company before touching its steps
