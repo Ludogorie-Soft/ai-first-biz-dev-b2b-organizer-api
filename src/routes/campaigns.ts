@@ -4,9 +4,22 @@ import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
 import { computeCampaignListProgress, computeCampaignReplyStats } from '../utils/campaignListAggregates'
 import { triggerNextSequenceStep } from '../utils/triggerNextSequenceStep'
+import {
+  FRIENDLY_WARMUP_PENDING,
+  findMailboxesPendingFriendlyWarmup,
+  releaseFriendlyWarmup,
+} from '../utils/friendlyWarmup'
 
 const router = Router()
 router.use(authMiddleware)
+
+function sendFriendlyWarmupConflict(res: Response, mailboxes: string[]): void {
+  res.status(409).json({
+    error: `These mailboxes must complete a warmup campaign first: ${mailboxes.join(', ')}`,
+    code: FRIENDLY_WARMUP_PENDING,
+    mailboxes,
+  })
+}
 
 /**
  * @swagger
@@ -88,11 +101,16 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
  *               mailbox_ids:
  *                 type: array
  *                 items: { type: string }
+ *               is_warmup:
+ *                 type: boolean
+ *                 description: The campaign's leads are friendly contacts warming up its mailboxes
  *     responses:
  *       201:
  *         description: Campaign created and email jobs enqueued
  *       400:
  *         description: Validation error
+ *       409:
+ *         description: A selected mailbox must complete a warmup campaign first
  */
 router.post('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
@@ -103,13 +121,14 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
       sequence_ids: z.array(z.string().uuid()).min(1),
       mailbox_ids: z.array(z.string().uuid()).min(1),
       send_on_weekends: z.boolean().optional().default(false),
+      is_warmup: z.boolean().optional().default(false),
     })
     const body = schema.parse(req.body)
 
     // 1. Check if any selected mailboxes are still pending SES approval
     const { data: mailboxes, error: mbErr } = await supabaseAdmin
       .from('mailboxes')
-      .select('id, ses_status')
+      .select('id, email, ses_status, friendly_warmup_pending')
       .in('id', body.mailbox_ids)
       .eq('company_id', req.user.company_id)
     if (mbErr) {
@@ -120,6 +139,16 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
       res.status(400).json({ error: 'One or more mailboxes not found' })
       return
     }
+    if (!body.is_warmup) {
+      const awaitingWarmup = (mailboxes as { email: string; friendly_warmup_pending: boolean }[])
+        .filter((mb) => mb.friendly_warmup_pending)
+        .map((mb) => mb.email)
+      if (awaitingWarmup.length > 0) {
+        sendFriendlyWarmupConflict(res, awaitingWarmup)
+        return
+      }
+    }
+
     const hasPendingMailbox = mailboxes.some((mb: { ses_status: string }) => mb.ses_status === 'pending')
     const campaignStatus = hasPendingMailbox ? 'pending_mailbox_approval' : 'active'
 
@@ -133,6 +162,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
         description: body.description,
         status: campaignStatus,
         send_on_weekends: body.send_on_weekends,
+        is_warmup: body.is_warmup,
       })
       .select()
       .single()
@@ -230,6 +260,8 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction): Prom
  *         description: Updated campaign
  *       404:
  *         description: Campaign not found
+ *       409:
+ *         description: A linked mailbox must complete a warmup campaign first
  */
 router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   if (!z.string().uuid().safeParse(req.params.id).success) {
@@ -251,13 +283,22 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
     if (body.status === 'active') {
       const { data: current } = await supabaseAdmin
         .from('campaigns')
-        .select('status')
+        .select('status, is_warmup, campaign_mailboxes(mailbox_id)')
         .eq('id', req.params.id)
         .eq('company_id', req.user.company_id)
         .single()
       if (current?.status === 'pending_mailbox_approval') {
         res.status(400).json({ error: 'Campaign cannot be activated until all mailboxes are approved in SES' })
         return
+      }
+      if (current && !current.is_warmup) {
+        const awaitingWarmup = await findMailboxesPendingFriendlyWarmup(
+          (current.campaign_mailboxes as { mailbox_id: string }[]).map((m) => m.mailbox_id)
+        )
+        if (awaitingWarmup.length > 0) {
+          sendFriendlyWarmupConflict(res, awaitingWarmup)
+          return
+        }
       }
     }
 
@@ -272,6 +313,11 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
       res.status(404).json({ error: 'Campaign not found' })
       return
     }
+
+    if (body.status === 'completed' && (data as { is_warmup?: boolean }).is_warmup) {
+      await releaseFriendlyWarmup(req.params.id as string)
+    }
+
     res.json(data)
   } catch (err) {
     if (err instanceof ZodError) {

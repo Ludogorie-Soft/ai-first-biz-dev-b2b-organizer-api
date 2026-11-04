@@ -336,6 +336,12 @@ To avoid the spam folder, emails are sent within a working window (09:00–17:00
 | 21+ | 18 emails/day |
 | Hard cap (v1) | 25 emails/day |
 
+### Friendly-contacts warmup
+
+A mailbox can be set to send to friendly contacts first, either when it is added or later from the Mailboxes page. While `friendly_warmup_pending` is on, only campaigns with `is_warmup` can send from it: creating or activating a normal campaign returns `409`, and emails already queued for normal campaigns wait. The flag clears when a warmup campaign using the mailbox completes, or when it is skipped by hand. Warmup campaigns always follow the working window and gaps above, even if the first step has `delay_days = 0`.
+
+### Bounces
+
 If a mailbox's hard bounce rate exceeds **5%** over the last 30 days, it is automatically paused and no further emails are sent from it. Bounces are detected via the SES webhook.
 
 ### SES Webhook Setup (AWS)
@@ -385,6 +391,7 @@ For non-standard headers:
 | `012_set_global_admins.sql` | Grants `global_admin` role to the configured admin emails |
 | `013_unsubscribe_tokens.sql` | Creates `unsubscribe_tokens` table for GDPR one-click unsubscribe |
 | `014_suppressed_emails.sql` | Creates `suppressed_emails` table — persistent suppression list that survives campaign deletion |
+| `024_friendly_warmup.sql` | Adds `friendly_warmup_pending` to mailboxes and `is_warmup` to campaigns |
 
 RLS is enforced on all tables using `public.get_auth_company_id()` — a `SECURITY DEFINER` function that prevents infinite recursion when querying the `users` table from within a policy.
 

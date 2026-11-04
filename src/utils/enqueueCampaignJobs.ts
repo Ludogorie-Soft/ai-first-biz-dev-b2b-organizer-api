@@ -17,7 +17,7 @@ export async function enqueueCampaignJobs(
 
   const { data: campaign } = await supabaseAdmin
     .from('campaigns')
-    .select('id, send_on_weekends, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
+    .select('id, send_on_weekends, is_warmup, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
     .eq('id', campaignId)
     .single()
 
@@ -26,6 +26,8 @@ export async function enqueueCampaignJobs(
   const sendOnWeekends = Boolean(
     (campaign as { send_on_weekends?: boolean }).send_on_weekends
   )
+
+  const isWarmup = Boolean((campaign as { is_warmup?: boolean }).is_warmup)
 
   const sequenceIds = (campaign.campaign_sequences as { sequence_id: string }[]).map(
     (s) => s.sequence_id
@@ -63,7 +65,9 @@ export async function enqueueCampaignJobs(
 
     if (!firstStep) continue
 
-    const sendImmediately = (firstStep as { delay_days: number }).delay_days === 0
+    // Warmup emails always keep the working window and gaps between sends: a burst
+    // from a new mailbox is what warmup exists to avoid.
+    const sendImmediately = (firstStep as { delay_days: number }).delay_days === 0 && !isWarmup
 
     // Distribute leads round-robin across mailboxes
     const mailboxLeads = new Map<string, string[]>()

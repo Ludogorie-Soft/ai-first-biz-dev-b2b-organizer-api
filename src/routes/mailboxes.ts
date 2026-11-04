@@ -22,10 +22,11 @@ const imapConfigSchema = z.object({
 const mailboxSchema = z.object({
   email: z.string().email(),
   imap_config: imapConfigSchema,
+  friendly_warmup: z.boolean().optional().default(false),
 })
 
 const MAILBOX_LIST_FIELDS =
-  'id, email, ses_status, is_paused, warmup_started_at, created_at, daily_email_limit, weekly_email_limit, signature'
+  'id, email, ses_status, is_paused, warmup_started_at, created_at, daily_email_limit, weekly_email_limit, signature, friendly_warmup_pending'
 
 /**
  * @swagger
@@ -93,6 +94,9 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
  *                   tls: { type: boolean }
  *                   user: { type: string }
  *                   password: { type: string }
+ *               friendly_warmup:
+ *                 type: boolean
+ *                 description: Hold normal campaigns until a warmup campaign has completed on this mailbox
  *     responses:
  *       201:
  *         description: Mailbox created
@@ -103,8 +107,14 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
     const encryptedConfig = encrypt(body.imap_config)
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .insert({ company_id: req.user.company_id, email: body.email, imap_config: encryptedConfig, ses_status: 'pending' })
-      .select('id, email, ses_status, created_at, signature')
+      .insert({
+        company_id: req.user.company_id,
+        email: body.email,
+        imap_config: encryptedConfig,
+        ses_status: 'pending',
+        friendly_warmup_pending: body.friendly_warmup,
+      })
+      .select('id, email, ses_status, created_at, signature, friendly_warmup_pending')
       .single()
     if (error) {
       res.status(400).json({ error: error.message })
@@ -179,7 +189,7 @@ async function notifyAdminsNewMailbox(mailboxEmail: string, companyId: string): 
  * @swagger
  * /mailboxes/{id}:
  *   patch:
- *     summary: Update mailbox signature
+ *     summary: Update mailbox signature or friendly-contacts warmup
  *     tags: [Mailboxes]
  *     security: [{ bearerAuth: [] }]
  *     parameters:
@@ -195,6 +205,7 @@ async function notifyAdminsNewMailbox(mailboxEmail: string, companyId: string): 
  *             type: object
  *             properties:
  *               signature: { type: string, nullable: true }
+ *               friendly_warmup_pending: { type: boolean }
  *     responses:
  *       200:
  *         description: Updated mailbox
@@ -216,11 +227,15 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
     const schema = z
       .object({
         signature: z.string().nullable().optional(),
+        friendly_warmup_pending: z.boolean().optional(),
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const parsed = schema.parse(req.body)
 
-    const updates: { signature?: string | null } = {}
+    const updates: { signature?: string | null; friendly_warmup_pending?: boolean } = {}
+    if (parsed.friendly_warmup_pending !== undefined) {
+      updates.friendly_warmup_pending = parsed.friendly_warmup_pending
+    }
     if (parsed.signature !== undefined) {
       if (parsed.signature === null || parsed.signature.trim() === '') {
         updates.signature = null

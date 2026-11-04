@@ -9,6 +9,7 @@ import { ATTACHMENT_BUCKET } from '../utils/attachments'
 import { getDailyLimit, delayMsForNextStep, msUntilNextDaySendWindow } from '../utils/warmup'
 import { ensureUnsubscribeToken } from '../utils/unsubscribeTokens'
 import { checkAndCompleteCampaign } from '../utils/campaignCompletion'
+import { isHeldForFriendlyWarmup } from '../utils/friendlyWarmup'
 import {
   EmailQueueRow,
   claimJobs,
@@ -168,6 +169,14 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
     is_paused: boolean
     email: string
     signature: string | null
+    friendly_warmup_pending: boolean
+  }
+
+  // Normal campaigns wait until the mailbox has finished its friendly-contacts warmup
+  if (mailboxTyped.friendly_warmup_pending && (await isHeldForFriendlyWarmup(campaignId))) {
+    await rescheduleJob(job.id, msUntilNextDaySendWindow(sendOnWeekends))
+    console.log(`[EmailSender] Mailbox ${mailboxId} is awaiting friendly warmup, job ${job.id} rescheduled`)
+    return
   }
 
   const includeSignature =

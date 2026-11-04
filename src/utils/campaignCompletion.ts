@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../config/supabase'
+import { releaseFriendlyWarmup } from './friendlyWarmup'
 
 async function getPrimarySequenceId(campaignId: string): Promise<string | null> {
   const { data } = await supabaseAdmin
@@ -75,7 +76,7 @@ export async function computeCampaignSequenceProgress(
 export async function checkAndCompleteCampaign(campaignId: string): Promise<void> {
   const { data: campaign } = await supabaseAdmin
     .from('campaigns')
-    .select('status')
+    .select('status, is_warmup')
     .eq('id', campaignId)
     .single()
 
@@ -117,5 +118,10 @@ export async function checkAndCompleteCampaign(campaignId: string): Promise<void
 
   if (error) {
     console.error('[CampaignCompletion] Failed to mark completed:', error.message)
+    return
+  }
+
+  if ((campaign as { is_warmup?: boolean }).is_warmup) {
+    await releaseFriendlyWarmup(campaignId)
   }
 }
