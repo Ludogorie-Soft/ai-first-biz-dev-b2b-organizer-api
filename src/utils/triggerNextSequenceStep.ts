@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '../config/supabase'
 import { enqueueJobs } from '../queues/dbEmailQueue'
 import { EmailJobData } from '../types'
+import { computeScheduledTimes, getDailyLimit } from './warmup'
 
 export interface TriggerConfirmationRequired {
   needs_confirmation: true
@@ -12,10 +13,16 @@ export interface TriggerConfirmationRequired {
   affected_leads: number
 }
 
+/** Why nothing was enqueued. */
+export type TriggerNoSendReason = 'no_active_leads' | 'no_steps' | 'sequence_complete'
+
 export interface TriggerSuccess {
   needs_confirmation: false
   enqueued: number
   affected_leads: number
+  reason?: TriggerNoSendReason
+  /** Warmup campaigns only: when the first email is scheduled, which can be well after now. */
+  first_send_at?: string
 }
 
 export type TriggerNextStepResult = TriggerConfirmationRequired | TriggerSuccess
@@ -29,6 +36,39 @@ interface LeadJob {
 }
 
 /**
+ * Delay for each job, in order, keeping the working window, gaps and daily limit
+ * of each mailbox: a burst from a new mailbox is what warmup exists to avoid.
+ */
+async function computeWarmupDelays(jobs: LeadJob[], sendOnWeekends: boolean): Promise<number[]> {
+  const jobCounts = new Map<string, number>()
+  for (const job of jobs) jobCounts.set(job.mailboxId, (jobCounts.get(job.mailboxId) ?? 0) + 1)
+
+  const { data: mailboxes, error } = await supabaseAdmin
+    .from('mailboxes')
+    .select('id, warmup_started_at, daily_email_limit')
+    .in('id', [...jobCounts.keys()])
+  if (error) throw new Error(`Failed to load mailboxes: ${error.message}`)
+
+  const now = new Date()
+  const limits = new Map(
+    ((mailboxes ?? []) as { id: string; warmup_started_at: string | null; daily_email_limit: number }[]).map((m) => [
+      m.id,
+      getDailyLimit(m.warmup_started_at ? new Date(m.warmup_started_at) : null, m.daily_email_limit),
+    ])
+  )
+
+  const timesByMailbox = new Map<string, Date[]>()
+  for (const [mailboxId, count] of jobCounts) {
+    timesByMailbox.set(
+      mailboxId,
+      computeScheduledTimes(count, limits.get(mailboxId) ?? getDailyLimit(null), now, sendOnWeekends)
+    )
+  }
+
+  return jobs.map((job) => timesByMailbox.get(job.mailboxId)!.shift()!.getTime() - now.getTime())
+}
+
+/**
  * Determine the next pending step for each active lead in a campaign and
  * either enqueue immediate jobs or return a confirmation-required payload.
  *
@@ -39,22 +79,27 @@ interface LeadJob {
  *
  * If force=false and any lead is still within its delay window, returns
  * TriggerConfirmationRequired so the caller can ask for user consent.
+ *
+ * Other campaigns send as soon as the worker picks the jobs up; warmup campaigns
+ * are scheduled by computeWarmupDelays, even with force=true.
  */
 export async function triggerNextSequenceStep(
   campaignId: string,
   sendOnWeekends: boolean,
   sequenceIds: string[],
   mailboxIds: string[],
-  force: boolean
+  force: boolean,
+  isWarmup: boolean
 ): Promise<TriggerNextStepResult> {
-  const { data: leads } = await supabaseAdmin
+  const { data: leads, error: leadsError } = await supabaseAdmin
     .from('leads')
     .select('id')
     .eq('campaign_id', campaignId)
     .eq('status', 'active')
+  if (leadsError) throw new Error(`Failed to load leads: ${leadsError.message}`)
 
   if (!leads || leads.length === 0) {
-    return { needs_confirmation: false, enqueued: 0, affected_leads: 0 }
+    return { needs_confirmation: false, enqueued: 0, affected_leads: 0, reason: 'no_active_leads' }
   }
 
   const leadIds = (leads as { id: string }[]).map((l) => l.id)
@@ -63,15 +108,18 @@ export async function triggerNextSequenceStep(
   const leadsToEnqueue: LeadJob[] = []
   let maxDaysRemaining = 0
   let maxDelayDays = 0
+  let hasSteps = false
 
   for (const sequenceId of sequenceIds) {
-    const { data: steps } = await supabaseAdmin
+    const { data: steps, error: stepsError } = await supabaseAdmin
       .from('sequence_steps')
       .select('id, step_order, delay_days')
       .eq('sequence_id', sequenceId)
       .order('step_order')
+    if (stepsError) throw new Error(`Failed to load sequence steps: ${stepsError.message}`)
 
     if (!steps || steps.length === 0) continue
+    hasSteps = true
 
     const typedSteps = steps as { id: string; step_order: number; delay_days: number }[]
     const firstStep = typedSteps[0]
@@ -79,7 +127,7 @@ export async function triggerNextSequenceStep(
 
     // Fetch most-recent sent log per lead for this sequence (ordered desc by sent_at;
     // we take the first occurrence per lead_id to get the latest)
-    const { data: emailLogs } = await supabaseAdmin
+    const { data: emailLogs, error: logsError } = await supabaseAdmin
       .from('email_logs')
       .select('lead_id, step_id, sent_at')
       .eq('campaign_id', campaignId)
@@ -87,6 +135,7 @@ export async function triggerNextSequenceStep(
       .eq('status', 'sent')
       .in('lead_id', leadIds)
       .order('sent_at', { ascending: false })
+    if (logsError) throw new Error(`Failed to load email logs: ${logsError.message}`)
 
     // last-sent step per lead
     const lastSentByLead = new Map<string, { stepId: string; sentAt: Date }>()
@@ -130,7 +179,12 @@ export async function triggerNextSequenceStep(
   }
 
   if (leadsToEnqueue.length === 0) {
-    return { needs_confirmation: false, enqueued: 0, affected_leads: 0 }
+    return {
+      needs_confirmation: false,
+      enqueued: 0,
+      affected_leads: 0,
+      reason: hasSteps ? 'sequence_complete' : 'no_steps',
+    }
   }
 
   // If any lead is still within its delay window, ask for confirmation
@@ -145,7 +199,11 @@ export async function triggerNextSequenceStep(
 
   // Enqueue all jobs — job_name is UNIQUE in the DB so double-triggers are
   // deduplicated automatically via ON CONFLICT DO NOTHING (ignoreDuplicates).
-  const jobs = leadsToEnqueue.map((info) => ({
+  const delays = isWarmup
+    ? await computeWarmupDelays(leadsToEnqueue, sendOnWeekends)
+    : leadsToEnqueue.map(() => 0)
+
+  const jobs = leadsToEnqueue.map((info, idx) => ({
     name: `trigger-${info.leadId}-${info.sequenceId}-${info.stepId}`,
     data: {
       campaignId,
@@ -155,10 +213,15 @@ export async function triggerNextSequenceStep(
       mailboxId: info.mailboxId,
       sendOnWeekends,
     } satisfies EmailJobData,
-    opts: { delay: 0 },
+    opts: { delay: delays[idx] },
   }))
 
   await enqueueJobs(jobs)
 
-  return { needs_confirmation: false, enqueued: jobs.length, affected_leads: leadsToEnqueue.length }
+  return {
+    needs_confirmation: false,
+    enqueued: jobs.length,
+    affected_leads: leadsToEnqueue.length,
+    ...(isWarmup && { first_send_at: new Date(Date.now() + Math.min(...delays)).toISOString() }),
+  }
 }

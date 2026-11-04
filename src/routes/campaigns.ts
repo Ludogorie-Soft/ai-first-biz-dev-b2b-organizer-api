@@ -9,6 +9,7 @@ import {
   findMailboxesPendingFriendlyWarmup,
   releaseFriendlyWarmup,
 } from '../utils/friendlyWarmup'
+import { SEQUENCE_HAS_NO_STEPS, findSequencesWithoutSteps } from '../utils/sequenceSteps'
 
 const router = Router()
 router.use(authMiddleware)
@@ -18,6 +19,14 @@ function sendFriendlyWarmupConflict(res: Response, mailboxes: string[]): void {
     error: `These mailboxes must complete a warmup campaign first: ${mailboxes.join(', ')}`,
     code: FRIENDLY_WARMUP_PENDING,
     mailboxes,
+  })
+}
+
+function sendEmptySequencesError(res: Response, sequences: string[]): void {
+  res.status(400).json({
+    error: `These sequences have no steps, so nothing would be sent: ${sequences.join(', ')}`,
+    code: SEQUENCE_HAS_NO_STEPS,
+    sequences,
   })
 }
 
@@ -108,7 +117,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
  *       201:
  *         description: Campaign created and email jobs enqueued
  *       400:
- *         description: Validation error
+ *         description: Validation error, or a selected sequence has no steps
  *       409:
  *         description: A selected mailbox must complete a warmup campaign first
  */
@@ -147,6 +156,12 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
         sendFriendlyWarmupConflict(res, awaitingWarmup)
         return
       }
+    }
+
+    const emptySequences = await findSequencesWithoutSteps(body.sequence_ids, req.user.company_id)
+    if (emptySequences.length > 0) {
+      sendEmptySequencesError(res, emptySequences)
+      return
     }
 
     const hasPendingMailbox = mailboxes.some((mb: { ses_status: string }) => mb.ses_status === 'pending')
@@ -258,6 +273,8 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction): Prom
  *     responses:
  *       200:
  *         description: Updated campaign
+ *       400:
+ *         description: Validation error, or a linked sequence has no steps
  *       404:
  *         description: Campaign not found
  *       409:
@@ -283,7 +300,7 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
     if (body.status === 'active') {
       const { data: current } = await supabaseAdmin
         .from('campaigns')
-        .select('status, is_warmup, campaign_mailboxes(mailbox_id)')
+        .select('status, is_warmup, campaign_mailboxes(mailbox_id), campaign_sequences(sequence_id)')
         .eq('id', req.params.id)
         .eq('company_id', req.user.company_id)
         .single()
@@ -297,6 +314,16 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
         )
         if (awaitingWarmup.length > 0) {
           sendFriendlyWarmupConflict(res, awaitingWarmup)
+          return
+        }
+      }
+      if (current) {
+        const emptySequences = await findSequencesWithoutSteps(
+          (current.campaign_sequences as { sequence_id: string }[]).map((s) => s.sequence_id),
+          req.user.company_id
+        )
+        if (emptySequences.length > 0) {
+          sendEmptySequencesError(res, emptySequences)
           return
         }
       }
@@ -409,10 +436,13 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
  *             properties:
  *               force:
  *                 type: boolean
- *                 description: Skip delay check and send immediately
+ *                 description: Skip the delay check. Warmup campaigns still keep the working window and gaps between sends.
  *     responses:
  *       200:
- *         description: Jobs enqueued or confirmation required
+ *         description: >
+ *           Jobs enqueued or confirmation required. When nothing is enqueued, `reason` is
+ *           no_active_leads, no_steps or sequence_complete. Warmup campaigns also return
+ *           `first_send_at`, the time the first email is scheduled for.
  *       400:
  *         description: Campaign not active or misconfigured
  *       404:
@@ -430,7 +460,7 @@ router.post('/:id/trigger-next-step', async (req: Request, res: Response, next: 
 
     const { data: campaign, error: campErr } = await supabaseAdmin
       .from('campaigns')
-      .select('id, send_on_weekends, status, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
+      .select('id, send_on_weekends, status, is_warmup, campaign_sequences(sequence_id), campaign_mailboxes(mailbox_id)')
       .eq('id', req.params.id)
       .eq('company_id', req.user.company_id)
       .single()
@@ -462,7 +492,8 @@ router.post('/:id/trigger-next-step', async (req: Request, res: Response, next: 
       Boolean((campaign as { send_on_weekends?: boolean }).send_on_weekends),
       sequenceIds,
       mailboxIds,
-      force
+      force,
+      Boolean((campaign as { is_warmup?: boolean }).is_warmup)
     )
 
     res.json(result)

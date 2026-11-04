@@ -116,6 +116,22 @@ describe('POST /campaigns', () => {
     const res = await send('POST', '', newCampaign)
     expect(res.status).toBe(201)
   })
+
+  it('rejects a sequence that has no steps without creating anything', async () => {
+    db.tables.mailboxes = [{ ...pendingMailbox, friendly_warmup_pending: false }]
+    db.tables.sequences = [{ name: 'Empty', sequence_steps: [] }]
+    const res = await send('POST', '', newCampaign)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ code: 'SEQUENCE_HAS_NO_STEPS', sequences: ['Empty'] })
+    expect(db.writes).toEqual([])
+  })
+
+  it('allows a sequence that has steps', async () => {
+    db.tables.mailboxes = [{ ...pendingMailbox, friendly_warmup_pending: false }]
+    db.tables.sequences = [{ name: 'Ready', sequence_steps: [{ id: 'step' }] }]
+    const res = await send('POST', '', newCampaign)
+    expect(res.status).toBe(201)
+  })
 })
 
 describe('PATCH /campaigns/:id', () => {
@@ -129,6 +145,27 @@ describe('PATCH /campaigns/:id', () => {
     const res = await send('PATCH', `/${CAMPAIGN_ID}`, { status: 'active' })
     expect(res.status).toBe(409)
     expect(db.writes).toEqual([])
+  })
+
+  it('rejects activating a campaign whose sequence has no steps', async () => {
+    db.tables.campaigns = {
+      status: 'paused',
+      is_warmup: false,
+      campaign_mailboxes: [],
+      campaign_sequences: [{ sequence_id: SEQUENCE_ID }],
+    }
+    db.tables.sequences = [{ name: 'Empty', sequence_steps: [] }]
+    const res = await send('PATCH', `/${CAMPAIGN_ID}`, { status: 'active' })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ code: 'SEQUENCE_HAS_NO_STEPS', sequences: ['Empty'] })
+    expect(db.writes).toEqual([])
+  })
+
+  it('still allows pausing a campaign whose sequence has no steps', async () => {
+    db.tables.campaigns = { status: 'active', is_warmup: false }
+    db.tables.sequences = [{ name: 'Empty', sequence_steps: [] }]
+    const res = await send('PATCH', `/${CAMPAIGN_ID}`, { status: 'paused' })
+    expect(res.status).toBe(200)
   })
 
   it('releases the mailboxes when a warmup campaign is completed by hand', async () => {

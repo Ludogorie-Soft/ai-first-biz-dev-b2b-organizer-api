@@ -338,7 +338,7 @@ To avoid the spam folder, emails are sent within a working window (09:00–17:00
 
 ### Friendly-contacts warmup
 
-A mailbox can be set to send to friendly contacts first, either when it is added or later from the Mailboxes page. While `friendly_warmup_pending` is on, only campaigns with `is_warmup` can send from it: creating or activating a normal campaign returns `409`, and emails already queued for normal campaigns wait. The flag clears when a warmup campaign using the mailbox completes, or when it is skipped by hand. Warmup campaigns always follow the working window and gaps above, even if the first step has `delay_days = 0`.
+A mailbox can be set to send to friendly contacts first, either when it is added or later from the Mailboxes page. While `friendly_warmup_pending` is on, only campaigns with `is_warmup` can send from it: creating or activating a normal campaign returns `409`, and emails already queued for normal campaigns wait. The flag clears when a warmup campaign using the mailbox completes, or when it is skipped by hand. Warmup campaigns always follow the working window and gaps above, even if the first step has `delay_days = 0` or the send is triggered by hand.
 
 ### Bounces
 
