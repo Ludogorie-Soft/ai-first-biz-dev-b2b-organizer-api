@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 
 const SEQUENCE_ID = '11111111-1111-4111-8111-111111111111'
 const STEP_ID = '22222222-2222-4222-8222-222222222222'
+const TEMPLATE_ID = '33333333-3333-4333-8333-333333333333'
 
 /** Records writes and answers every query with a matching row. */
 const db = vi.hoisted(() => {
@@ -22,6 +23,11 @@ const db = vi.hoisted(() => {
       insert: (values: Record<string, unknown>) => {
         writes.push({ table, op: 'insert', values })
         row = { id: 'row', ...values }
+        return builder
+      },
+      delete: () => {
+        writes.push({ table, op: 'delete', values: {} })
+        row = { id: 'row' }
         return builder
       },
       single: async () => ({ data: row, error: null }),
@@ -64,7 +70,7 @@ beforeEach(() => {
 function upload(name: string, content: string | Buffer) {
   const form = new FormData()
   form.append('file', new Blob([content]), name)
-  return fetch(`${base}/template`, { method: 'POST', body: form })
+  return fetch(`${base}/templates`, { method: 'POST', body: form })
 }
 
 function sendJson(method: string, path: string, body: unknown) {
@@ -84,20 +90,34 @@ const EML = [
   '<html><head><title>Acme Ltd</title></head><body style="margin:0"><img style="display:none" src="https://t.test/open"><p style="color:red">Hello</p><script>alert(1)</script></body></html>',
 ].join('\r\n')
 
-describe('POST /sequences/:id/template', () => {
+describe('POST /sequences/:id/templates', () => {
   it('stores a sanitized template from an EML file and reports what it removed', async () => {
     const res = await upload('offer.eml', EML)
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(201)
     const body = await res.json()
-    expect(body.template_file_name).toBe('offer.eml')
-    expect(body.template_html).toContain('<p style="color:red">Hello</p>')
-    expect(body.template_html).not.toMatch(/Acme|script|t\.test/)
+    expect(body.name).toBe('offer.eml')
+    expect(body.file_name).toBe('offer.eml')
+    expect(body.html).toContain('<p style="color:red">Hello</p>')
+    expect(body.html).not.toMatch(/Acme|script|t\.test/)
     expect(body.warnings.removedTrackingPixels).toBe(1)
+    expect(db.writes[0]).toMatchObject({
+      table: 'sequence_templates',
+      op: 'insert',
+      values: { sequence_id: SEQUENCE_ID, name: 'offer.eml', file_name: 'offer.eml' },
+    })
+  })
+
+  it('adds another template instead of replacing the first', async () => {
+    await upload('one.html', '<p>One</p>')
+    await upload('two.html', '<p>Two</p>')
+    const inserts = db.writes.filter((w) => w.op === 'insert')
+    expect(inserts).toHaveLength(2)
+    expect(inserts.map((w) => w.values.name)).toEqual(['one.html', 'two.html'])
   })
 
   it('accepts HTML files', async () => {
     const res = await upload('offer.html', '<p>Hello</p>')
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(201)
   })
 
   it('rejects other file types without saving', async () => {
@@ -120,30 +140,36 @@ describe('POST /sequences/:id/template', () => {
   })
 })
 
-describe('PATCH /sequences/:id template_html', () => {
+describe('PATCH /sequences/:id/templates/:templateId', () => {
   it('sanitizes the edited template', async () => {
-    const res = await sendJson('PATCH', '', {
-      template_html: '<body><p>{{company_name}}</p><script>alert(1)</script></body>',
+    const res = await sendJson('PATCH', `/templates/${TEMPLATE_ID}`, {
+      html: '<body><p>{{company_name}}</p><script>alert(1)</script></body>',
     })
     expect(res.status).toBe(200)
-    const saved = db.writes[0].values.template_html as string
+    const saved = db.writes.find((w) => w.table === 'sequence_templates')!.values.html as string
     expect(saved).toContain('{{company_name}}')
     expect(saved).not.toContain('script')
+  })
+
+  it('renames a template', async () => {
+    const res = await sendJson('PATCH', `/templates/${TEMPLATE_ID}`, { name: 'Spring offer' })
+    expect(res.status).toBe(200)
+    expect(db.writes.find((w) => w.table === 'sequence_templates')!.values).toEqual({ name: 'Spring offer' })
   })
 
   it('accepts a template at the size limit, with JSON escaping overhead', async () => {
     const line = '<p style="color:red">x</p>\n'
     const html = line.repeat(Math.floor((85 * 1024) / line.length))
-    const res = await sendJson('PATCH', '', { template_html: html })
+    const res = await sendJson('PATCH', `/templates/${TEMPLATE_ID}`, { html })
     expect(res.status).toBe(200)
   })
 })
 
-describe('DELETE /sequences/:id/template', () => {
-  it('clears the template', async () => {
-    const res = await fetch(`${base}/template`, { method: 'DELETE' })
+describe('DELETE /sequences/:id/templates/:templateId', () => {
+  it('removes that template only', async () => {
+    const res = await fetch(`${base}/templates/${TEMPLATE_ID}`, { method: 'DELETE' })
     expect(res.status).toBe(204)
-    expect(db.writes[0].values).toEqual({ template_html: null, template_file_name: null })
+    expect(db.writes.find((w) => w.op === 'delete')!.table).toBe('sequence_templates')
   })
 })
 
@@ -171,6 +197,16 @@ describe('sequence steps with a styled template', () => {
       styled_html: '<p>Styled</p>',
     })
     expect(db.writes[0].values.body).toBe('<p>Plain</p>')
+  })
+
+  it('stores the template a styled step was based on', async () => {
+    await sendJson('POST', '/steps', {
+      ...step,
+      use_template: true,
+      template_id: TEMPLATE_ID,
+      styled_html: '<p>Styled</p>',
+    })
+    expect(db.writes[0].values.template_id).toBe(TEMPLATE_ID)
   })
 
   it('still creates plain steps as before', async () => {

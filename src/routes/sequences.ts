@@ -30,6 +30,14 @@ const upload = multer({
 })
 
 const STEPS_WITH_ATTACHMENTS = '*, sequence_steps(*, sequence_step_attachments(*))'
+const SEQUENCE_DETAIL =
+  '*, sequence_templates(*), sequence_steps(*, sequence_step_attachments(*))'
+
+/** Keep the uploaded file name, including letters outside ASCII, as the default label. */
+function templateLabel(originalName: string): string {
+  const base = originalName.replace(/[/\\]/g, '_').replace(/[\u0000-\u001f]/g, '').trim()
+  return base.slice(0, 180)
+}
 
 /**
  * @swagger
@@ -144,6 +152,7 @@ router.post('/:id/steps', async (req: Request, res: Response, next: NextFunction
       delay_days: z.number().int().min(0).default(0),
       use_template: z.boolean().default(false),
       styled_html: z.string().min(1).optional(),
+      template_id: z.string().uuid().nullable().optional(),
     })
     const parsed = schema.parse(req.body)
 
@@ -182,6 +191,19 @@ router.post('/:id/steps', async (req: Request, res: Response, next: NextFunction
     if (seqErr || !seq) {
       res.status(404).json({ error: 'Sequence not found' })
       return
+    }
+
+    if (parsed.template_id) {
+      const { data: template } = await supabaseAdmin
+        .from('sequence_templates')
+        .select('id')
+        .eq('id', parsed.template_id)
+        .eq('sequence_id', req.params.id)
+        .single()
+      if (!template) {
+        res.status(400).json({ error: 'Template not found' })
+        return
+      }
     }
 
     const { data, error } = await supabaseAdmin
@@ -229,9 +251,10 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction): Prom
   try {
     const { data, error } = await supabaseAdmin
       .from('sequences')
-      .select(STEPS_WITH_ATTACHMENTS)
+      .select(SEQUENCE_DETAIL)
       .eq('id', req.params.id)
       .eq('company_id', req.user.company_id)
+      .order('created_at', { referencedTable: 'sequence_templates' })
       .order('step_order', { referencedTable: 'sequence_steps' })
       .single()
     if (error || !data) {
@@ -265,7 +288,6 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction): Prom
  *             properties:
  *               name: { type: string }
  *               include_signature: { type: boolean }
- *               template_html: { type: string, description: Edited template HTML }
  *     responses:
  *       200:
  *         description: Updated sequence
@@ -282,19 +304,9 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
       .object({
         name: z.string().min(1).optional(),
         include_signature: z.boolean().optional(),
-        template_html: z.string().min(1).optional(),
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const body = schema.parse(req.body)
-
-    if (body.template_html !== undefined) {
-      const prepared = prepareStyledHtml(body.template_html)
-      if ('error' in prepared) {
-        res.status(400).json({ error: prepared.error })
-        return
-      }
-      body.template_html = prepared.html
-    }
 
     const { data, error } = await supabaseAdmin
       .from('sequences')
@@ -382,9 +394,9 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
 
 /**
  * @swagger
- * /sequences/{id}/template:
+ * /sequences/{id}/templates:
  *   post:
- *     summary: Upload the sequence's styled email template (HTML or EML)
+ *     summary: Add a styled email template (HTML or EML) to the sequence
  *     tags: [Sequences]
  *     security: [{ bearerAuth: [] }]
  *     parameters:
@@ -401,16 +413,17 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
  *             required: [file]
  *             properties:
  *               file: { type: string, format: binary }
+ *               name: { type: string, description: Defaults to the file name }
  *     responses:
- *       200:
- *         description: Updated sequence, plus warnings about content removed from the file
+ *       201:
+ *         description: Created template, plus warnings about content removed from the file
  *       400:
  *         description: Validation error
  *       404:
  *         description: Sequence not found
  */
 router.post(
-  '/:id/template',
+  '/:id/templates',
   (req: Request, res: Response, next: NextFunction) => {
     upload.single('file')(req, res, (err: unknown) => {
       if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
@@ -455,21 +468,36 @@ router.post(
         return
       }
 
-      const { data, error } = await supabaseAdmin
+      const { data: seq } = await supabaseAdmin
         .from('sequences')
-        .update({
-          template_html: prepared.html,
-          template_file_name: sanitizeFileName(file.originalname),
-        })
+        .select('id')
         .eq('id', req.params.id)
         .eq('company_id', req.user.company_id)
-        .select()
         .single()
-      if (error || !data) {
+      if (!seq) {
         res.status(404).json({ error: 'Sequence not found' })
         return
       }
-      res.json({ ...data, warnings: prepared.warnings })
+
+      const fileName = templateLabel(file.originalname) || 'template'
+      const requestedName = typeof req.body?.name === 'string' ? templateLabel(req.body.name) : ''
+      const name = requestedName || fileName
+
+      const { data, error } = await supabaseAdmin
+        .from('sequence_templates')
+        .insert({
+          sequence_id: req.params.id,
+          name,
+          file_name: fileName,
+          html: prepared.html,
+        })
+        .select()
+        .single()
+      if (error || !data) {
+        res.status(400).json({ error: error?.message || 'Could not save template' })
+        return
+      }
+      res.status(201).json({ ...data, warnings: prepared.warnings })
     } catch (err) {
       next(err)
     }
@@ -478,9 +506,9 @@ router.post(
 
 /**
  * @swagger
- * /sequences/{id}/template:
- *   delete:
- *     summary: Remove the sequence's styled template. Steps keep their own copies.
+ * /sequences/{id}/templates/{templateId}:
+ *   patch:
+ *     summary: Rename a template or save edits to its HTML
  *     tags: [Sequences]
  *     security: [{ bearerAuth: [] }]
  *     parameters:
@@ -488,27 +516,131 @@ router.post(
  *         name: id
  *         required: true
  *         schema: { type: string }
+ *       - in: path
+ *         name: templateId
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name: { type: string }
+ *               html: { type: string }
+ *     responses:
+ *       200:
+ *         description: Updated template
+ *       404:
+ *         description: Template not found
+ */
+router.patch('/:id/templates/:templateId', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success ||
+      !z.string().uuid().safeParse(req.params.templateId).success) {
+    res.status(400).json({ error: 'Invalid ID' })
+    return
+  }
+  try {
+    const schema = z
+      .object({
+        name: z.string().trim().min(1).max(180).optional(),
+        html: z.string().min(1).optional(),
+      })
+      .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
+    const parsed = schema.parse(req.body)
+    const patch: { name?: string; html?: string } = {}
+    if (parsed.name !== undefined) patch.name = parsed.name
+    if (parsed.html !== undefined) {
+      const prepared = prepareStyledHtml(parsed.html)
+      if ('error' in prepared) {
+        res.status(400).json({ error: prepared.error })
+        return
+      }
+      patch.html = prepared.html
+    }
+
+    const { data: seq } = await supabaseAdmin
+      .from('sequences')
+      .select('id')
+      .eq('id', req.params.id)
+      .eq('company_id', req.user.company_id)
+      .single()
+    if (!seq) {
+      res.status(404).json({ error: 'Sequence not found' })
+      return
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('sequence_templates')
+      .update(patch)
+      .eq('id', req.params.templateId)
+      .eq('sequence_id', req.params.id)
+      .select()
+      .single()
+    if (error || !data) {
+      res.status(404).json({ error: 'Template not found' })
+      return
+    }
+    res.json(data)
+  } catch (err) {
+    if (err instanceof ZodError) {
+      res.status(400).json({ error: err.errors })
+      return
+    }
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /sequences/{id}/templates/{templateId}:
+ *   delete:
+ *     summary: Remove one styled template. Steps keep their own copies.
+ *     tags: [Sequences]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *       - in: path
+ *         name: templateId
+ *         required: true
+ *         schema: { type: string }
  *     responses:
  *       204:
  *         description: Removed
  *       404:
- *         description: Sequence not found
+ *         description: Template not found
  */
-router.delete('/:id/template', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-  if (!z.string().uuid().safeParse(req.params.id).success) {
-    res.status(400).json({ error: 'Invalid sequence ID' })
+router.delete('/:id/templates/:templateId', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success ||
+      !z.string().uuid().safeParse(req.params.templateId).success) {
+    res.status(400).json({ error: 'Invalid ID' })
     return
   }
   try {
-    const { data, error } = await supabaseAdmin
+    const { data: seq } = await supabaseAdmin
       .from('sequences')
-      .update({ template_html: null, template_file_name: null })
+      .select('id')
       .eq('id', req.params.id)
       .eq('company_id', req.user.company_id)
+      .single()
+    if (!seq) {
+      res.status(404).json({ error: 'Sequence not found' })
+      return
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('sequence_templates')
+      .delete()
+      .eq('id', req.params.templateId)
+      .eq('sequence_id', req.params.id)
       .select('id')
       .single()
     if (error || !data) {
-      res.status(404).json({ error: 'Sequence not found' })
+      res.status(404).json({ error: 'Template not found' })
       return
     }
     res.status(204).send()
@@ -567,6 +699,7 @@ router.patch('/:id/steps/:stepId', async (req: Request, res: Response, next: Nex
         step_order: z.number().int().positive().optional(),
         use_template: z.boolean().optional(),
         styled_html: z.string().min(1).optional(),
+        template_id: z.string().uuid().nullable().optional(),
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const parsed = schema.parse(req.body)
@@ -601,6 +734,19 @@ router.patch('/:id/steps/:stepId', async (req: Request, res: Response, next: Nex
     if (!seq) {
       res.status(404).json({ error: 'Sequence not found' })
       return
+    }
+
+    if (parsed.template_id) {
+      const { data: template } = await supabaseAdmin
+        .from('sequence_templates')
+        .select('id')
+        .eq('id', parsed.template_id)
+        .eq('sequence_id', req.params.id)
+        .single()
+      if (!template) {
+        res.status(400).json({ error: 'Template not found' })
+        return
+      }
     }
 
     const { data, error } = await supabaseAdmin
