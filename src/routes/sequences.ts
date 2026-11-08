@@ -33,6 +33,18 @@ const STEPS_WITH_ATTACHMENTS = '*, sequence_steps(*, sequence_step_attachments(*
 const SEQUENCE_DETAIL =
   '*, sequence_templates(*), sequence_steps(*, sequence_step_attachments(*))'
 
+/**
+ * A multipart filename parameter is one character per byte. Browsers send those
+ * bytes as UTF-8, so Cyrillic and € arrive looking like Latin-1. Names that
+ * already contain characters outside Latin-1 were decoded by the parser.
+ */
+function decodeMultipartFilename(name: string): string {
+  if ([...name].some((char) => char.charCodeAt(0) > 0xff)) return name
+  const decoded = Buffer.from(name, 'latin1').toString('utf8')
+  if (decoded.includes('\uFFFD')) return name
+  return decoded
+}
+
 /** Keep the uploaded file name, including letters outside ASCII, as the default label. */
 function templateLabel(originalName: string): string {
   const base = originalName.replace(/[/\\]/g, '_').replace(/[\u0000-\u001f]/g, '').trim()
@@ -448,7 +460,8 @@ router.post(
         res.status(400).json({ error: 'File is required' })
         return
       }
-      const extension = file.originalname.split('.').pop()?.toLowerCase() || ''
+      const originalName = decodeMultipartFilename(file.originalname)
+      const extension = originalName.split('.').pop()?.toLowerCase() || ''
       if (!TEMPLATE_EXTENSIONS.includes(extension)) {
         res.status(400).json({ error: 'File type not allowed. Use HTML or EML' })
         return
@@ -456,7 +469,7 @@ router.post(
 
       let rawHtml: string
       try {
-        rawHtml = await extractTemplateHtml(file.originalname, file.buffer)
+        rawHtml = await extractTemplateHtml(originalName, file.buffer)
       } catch (err) {
         res.status(400).json({ error: (err as Error).message })
         return
@@ -479,8 +492,9 @@ router.post(
         return
       }
 
-      const fileName = templateLabel(file.originalname) || 'template'
-      const requestedName = typeof req.body?.name === 'string' ? templateLabel(req.body.name) : ''
+      const fileName = templateLabel(originalName) || 'template'
+      const requestedName =
+        typeof req.body?.name === 'string' ? templateLabel(decodeMultipartFilename(req.body.name)) : ''
       const name = requestedName || fileName
 
       const { data, error } = await supabaseAdmin

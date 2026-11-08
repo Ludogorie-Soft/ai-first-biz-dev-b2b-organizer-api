@@ -65,7 +65,7 @@ Fill in the required values (see [Environment Variables](#environment-variables)
 
 ### 3. Run database migrations
 
-Run these in order in the Supabase SQL editor:
+Apply these in order against the database for `SUPABASE_URL`. A fresh database needs every file. A database that is already on `024` only needs `025`.
 
 ```
 supabase/migrations/001_initial_schema.sql
@@ -75,13 +75,40 @@ supabase/migrations/004_mailbox_warmup.sql
 supabase/migrations/005_email_verifications.sql
 supabase/migrations/006_org_management.sql
 supabase/migrations/007_simplify_org.sql
-supabase/migrations/008_campaigns_direct_leads.sql
-supabase/migrations/009_leads_campaign_direct.sql
-supabase/migrations/010_email_tracking.sql
+supabase/migrations/008_leads_company_position.sql
+supabase/migrations/009_leads_campaign_id.sql
+supabase/migrations/010_user_companies.sql
 supabase/migrations/011_global_admin.sql
 supabase/migrations/012_set_global_admins.sql
 supabase/migrations/013_unsubscribe_tokens.sql
+supabase/migrations/014_suppressed_emails.sql
+supabase/migrations/015_leads_office_email.sql
+supabase/migrations/016_mailbox_email_limits.sql
+supabase/migrations/017_campaign_send_on_weekends.sql
+supabase/migrations/018_email_queue.sql
+supabase/migrations/019_email_log_error_message.sql
+supabase/migrations/020_email_log_recipient_email.sql
+supabase/migrations/021_sequence_step_attachments.sql
+supabase/migrations/022_mailbox_signature.sql
+supabase/migrations/023_styled_email_templates.sql
+supabase/migrations/024_friendly_warmup.sql
+supabase/migrations/025_sequence_templates.sql
 ```
+
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` talk to the Data API and cannot run these files. Add the Postgres URI to `.env` as `DATABASE_URL` (Supabase → Project Settings → Database → Connection string → URI, **direct** connection on port 5432, same project as `SUPABASE_URL`). Percent-encode special characters in the password.
+
+From `ai-first-biz-dev-b2b-organizer-api` in PowerShell, this applies `025` to whatever database that URI points at:
+
+```powershell
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^\s*DATABASE_URL=(.*)$') {
+    $env:DATABASE_URL = $matches[1].Trim().Trim('"').Trim("'")
+  }
+}
+npx supabase db query --db-url $env:DATABASE_URL -f supabase/migrations/025_sequence_templates.sql
+```
+
+The same command works for any file in the list: change the `-f` path. Run them one at a time, in order, and stop if a file errors. You can also paste a file into the Supabase SQL editor.
 
 ### 4. Start development
 
@@ -108,6 +135,7 @@ Swagger docs: `http://localhost:3000/api/docs`
 |---|---|---|---|
 | `SUPABASE_URL` | Required | Required | Project URL from Supabase → Settings → Data API |
 | `SUPABASE_SERVICE_ROLE_KEY` | Required | Required | Service role key (bypasses RLS — keep secret) |
+| `DATABASE_URL` | Migrations only | — | Direct Postgres URI (port 5432) used by `npx supabase db query` to apply `supabase/migrations/*.sql`. Not read by the API or worker |
 | `FRONTEND_URL` | Required | Required | Frontend base URL (invites, verification, unsubscribe links) |
 | `API_URL` | Required | Required | Public API base URL (`List-Unsubscribe` headers). On Vercel: `https://your-project.vercel.app` |
 | `AWS_ACCESS_KEY_ID` | Required | Required | IAM key with SES access |

@@ -107,6 +107,37 @@ describe('POST /sequences/:id/templates', () => {
     })
   })
 
+  it('keeps Bulgarian letters and the euro sign in the uploaded file name', async () => {
+    const name =
+      'Елпласт ЕООД_ 7 подходящи програми за финансиране, до 450 000 € безвъзмездно.eml'
+    const boundary = '----sequenceTemplate'
+    const body = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="`,
+      ),
+      Buffer.from(name, 'utf8'),
+      Buffer.from(`"\r\nContent-Type: message/rfc822\r\n\r\n`),
+      Buffer.from(EML),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ])
+
+    const res = await fetch(`${base}/templates`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body,
+    })
+    expect(res.status).toBe(201)
+    const saved = await res.json()
+    expect(saved.name).toBe(name)
+    expect(saved.file_name).toBe(name)
+
+    const viaForm = await upload(name, EML)
+    expect(viaForm.status).toBe(201)
+    const viaFormBody = await viaForm.json()
+    expect(viaFormBody.name).toBe(name)
+    expect(viaFormBody.file_name).toBe(name)
+  })
+
   it('adds another template instead of replacing the first', async () => {
     await upload('one.html', '<p>One</p>')
     await upload('two.html', '<p>Two</p>')
