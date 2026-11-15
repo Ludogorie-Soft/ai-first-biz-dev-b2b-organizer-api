@@ -455,4 +455,201 @@ router.patch('/mailboxes/:id/limits', async (req: Request, res: Response, next: 
   }
 })
 
+// ─── Email jobs (queue history) ──────────────────────────────────────────────
+
+const JOB_STATUSES = ['pending', 'processing', 'sent', 'failed'] as const
+type JobStatus = (typeof JOB_STATUSES)[number]
+
+const jobsQuerySchema = z.object({
+  status: z.enum([...JOB_STATUSES, 'all']).default('pending'),
+})
+
+async function countQueueByStatus(campaignId?: string): Promise<Record<JobStatus, number>> {
+  const counts = await Promise.all(
+    JOB_STATUSES.map(async (status) => {
+      let q = supabaseAdmin
+        .from('email_queue')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', status)
+      if (campaignId) q = q.eq('campaign_id', campaignId)
+      const { count } = await q
+      return [status, count ?? 0] as const
+    })
+  )
+  return Object.fromEntries(counts) as Record<JobStatus, number>
+}
+
+/**
+ * @swagger
+ * /admin/jobs:
+ *   get:
+ *     summary: List email jobs (queue rows grouped by campaign, sender, step and status) across all companies (global admin only)
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [pending, processing, sent, failed, all]
+ *           default: pending
+ *     responses:
+ *       200:
+ *         description: "{ jobs: [...], counts: { pending, processing, sent, failed } }"
+ */
+router.get('/jobs', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  const parsed = jobsQuerySchema.safeParse(req.query)
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.errors })
+    return
+  }
+  const { status } = parsed.data
+
+  try {
+    const [{ data, error }, counts] = await Promise.all([
+      supabaseAdmin.rpc('admin_email_job_groups', {
+        p_status: status === 'all' ? null : status,
+        p_campaign_id: null,
+        p_limit: 500,
+      }),
+      countQueueByStatus(),
+    ])
+
+    if (error) {
+      res.status(400).json({ error: error.message })
+      return
+    }
+
+    // Upcoming work first for pending/processing, most recent activity first otherwise
+    const jobs = (data ?? []) as Array<{ first_scheduled_at: string; last_updated_at: string }>
+    if (status === 'pending' || status === 'processing') {
+      jobs.sort((a, b) => a.first_scheduled_at.localeCompare(b.first_scheduled_at))
+    }
+
+    res.json({ jobs, counts })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /admin/campaigns/{id}:
+ *   get:
+ *     summary: Full campaign details across any company, including queue and send stats (global admin only)
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Campaign with company, sequences, mailboxes, lead/email stats and job breakdown
+ *       404:
+ *         description: Campaign not found
+ */
+router.get('/campaigns/:id', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid campaign ID' })
+    return
+  }
+  const campaignId = req.params.id as string
+
+  try {
+    const { data: campaign, error } = await supabaseAdmin
+      .from('campaigns')
+      .select(`
+        id, name, description, status, send_on_weekends, is_warmup, created_at,
+        company:companies(id, name),
+        campaign_sequences(sequence:sequences(id, name, sequence_steps(id, step_order, subject, delay_days))),
+        campaign_mailboxes(mailbox:mailboxes(id, email, ses_status, is_paused, daily_email_limit, weekly_email_limit))
+      `)
+      .eq('id', campaignId)
+      .single()
+
+    if (error || !campaign) {
+      res.status(404).json({ error: 'Campaign not found' })
+      return
+    }
+
+    const LEAD_STATUSES = ['active', 'replied', 'unsubscribed', 'bounced', 'opted_out'] as const
+    const LOG_STATUSES = ['sent', 'failed', 'bounced'] as const
+
+    const countLeads = async (status: string) => {
+      const { count } = await supabaseAdmin
+        .from('leads')
+        .select('id', { count: 'exact', head: true })
+        .eq('campaign_id', campaignId)
+        .eq('status', status)
+      return [status, count ?? 0] as const
+    }
+    const countLogs = async (status: string) => {
+      const { count } = await supabaseAdmin
+        .from('email_logs')
+        .select('id', { count: 'exact', head: true })
+        .eq('campaign_id', campaignId)
+        .eq('status', status)
+      return [status, count ?? 0] as const
+    }
+
+    const [leadEntries, logEntries, repliedRes, queueCounts, jobsRes] = await Promise.all([
+      Promise.all(LEAD_STATUSES.map(countLeads)),
+      Promise.all(LOG_STATUSES.map(countLogs)),
+      supabaseAdmin
+        .from('email_logs')
+        .select('id', { count: 'exact', head: true })
+        .eq('campaign_id', campaignId)
+        .not('reply_category', 'is', null),
+      countQueueByStatus(campaignId),
+      supabaseAdmin.rpc('admin_email_job_groups', {
+        p_status: null,
+        p_campaign_id: campaignId,
+        p_limit: 500,
+      }),
+    ])
+
+    const leadCounts = Object.fromEntries(leadEntries) as Record<string, number>
+    const logCounts = Object.fromEntries(logEntries) as Record<string, number>
+    const emailStats = {
+      sent: logCounts.sent ?? 0,
+      failed: logCounts.failed ?? 0,
+      bounced: logCounts.bounced ?? 0,
+      replied: repliedRes.count ?? 0,
+    }
+
+    const c = campaign as any
+    res.json({
+      id: c.id,
+      name: c.name,
+      description: c.description,
+      status: c.status,
+      send_on_weekends: c.send_on_weekends,
+      is_warmup: c.is_warmup,
+      created_at: c.created_at,
+      company: c.company,
+      sequences: (c.campaign_sequences ?? [])
+        .map((cs: any) => cs.sequence)
+        .filter(Boolean)
+        .map((s: any) => ({
+          ...s,
+          sequence_steps: [...(s.sequence_steps ?? [])].sort(
+            (a: any, b: any) => a.step_order - b.step_order
+          ),
+        })),
+      mailboxes: (c.campaign_mailboxes ?? []).map((cm: any) => cm.mailbox).filter(Boolean),
+      lead_counts: {
+        total: Object.values(leadCounts).reduce((sum, n) => sum + n, 0),
+        by_status: leadCounts,
+      },
+      email_stats: emailStats,
+      queue_counts: queueCounts,
+      jobs: jobsRes.data ?? [],
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
 export default router
