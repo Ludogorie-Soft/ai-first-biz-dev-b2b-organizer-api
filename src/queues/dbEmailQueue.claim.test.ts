@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  */
 const db = vi.hoisted(() => {
   type Row = Record<string, unknown>
-  const tables: Record<string, Row[]> = { campaigns: [], email_queue: [] }
+  const tables: Record<string, Row[]> = { campaigns: [], mailboxes: [], email_queue: [] }
 
   const from = (table: string) => {
     const filters: Array<(r: Row) => boolean> = []
@@ -28,6 +28,12 @@ const db = vi.hoisted(() => {
       eq: (col: string, v: unknown) => (filters.push((r) => r[col] === v), builder),
       lte: (col: string, v: string) => (filters.push((r) => String(r[col]) <= v), builder),
       in: (col: string, vs: unknown[]) => (filters.push((r) => vs.includes(r[col])), builder),
+      // Only the form claimJobs uses: not(col, 'in', '(a,b)')
+      not: (col: string, _op: string, list: string) => {
+        const vs = list.replace(/^\(|\)$/g, '').split(',')
+        filters.push((r) => !vs.includes(String(r[col])))
+        return builder
+      },
       order: (col: string) => ((orderBy = col), builder),
       limit: (n: number) => ((max = n), builder),
       then: (resolve: (v: unknown) => unknown) => resolve(run()),
@@ -53,6 +59,10 @@ beforeEach(() => {
     { id: 'active', status: 'active' },
     { id: 'paused', status: 'paused' },
     { id: 'done', status: 'completed' },
+  ]
+  db.tables.mailboxes = [
+    { id: 'mb-ok', is_paused: false },
+    { id: 'mb-paused', is_paused: true },
   ]
   db.tables.email_queue = []
 })
@@ -98,6 +108,22 @@ describe('claimJobs', () => {
     const claimed = await claimJobs(2)
 
     expect(claimed.map((j) => j.id).sort()).toEqual(['early', 'mid'])
+  })
+
+  it('holds jobs of a paused mailbox as pending and still claims other mailboxes', async () => {
+    db.tables.email_queue = [
+      job('held', 'active', { mailbox_id: 'mb-paused', scheduled_at: '2026-01-01T00:00:00.000Z' }),
+      job('ok', 'active', { mailbox_id: 'mb-ok', scheduled_at: '2026-01-02T00:00:00.000Z' }),
+    ]
+
+    const claimed = await claimJobs(5)
+
+    expect(claimed.map((j) => j.id)).toEqual(['ok'])
+    expect(db.tables.email_queue.find((r) => r.id === 'held')?.status).toBe('pending')
+
+    // Unpausing the mailbox releases the held job
+    db.tables.mailboxes[1].is_paused = false
+    expect((await claimJobs(5)).map((j) => j.id)).toEqual(['held'])
   })
 
   it('returns nothing when there are no active campaigns', async () => {

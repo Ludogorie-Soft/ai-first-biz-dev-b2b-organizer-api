@@ -93,6 +93,8 @@ supabase/migrations/022_mailbox_signature.sql
 supabase/migrations/023_styled_email_templates.sql
 supabase/migrations/024_friendly_warmup.sql
 supabase/migrations/025_sequence_templates.sql
+supabase/migrations/026_admin_email_jobs.sql
+supabase/migrations/027_mailbox_pause_reason.sql
 ```
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` talk to the Data API and cannot run these files. Add the Postgres URI to `.env` as `DATABASE_URL` (Supabase → Project Settings → Database → Connection string → URI, **direct** connection on port 5432, same project as `SUPABASE_URL`). Percent-encode special characters in the password.
@@ -166,8 +168,7 @@ node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
    - `GET https://your-project.vercel.app/health` → `{ "status": "ok" }`
    - `GET https://your-project.vercel.app/api/docs` → Swagger UI
 4. Set `API_URL` to your Vercel URL (and `FRONTEND_URL` to the frontend).
-5. Point AWS SNS bounce/complaint subscription to:
-   `https://your-project.vercel.app/webhooks/ses?token=YOUR_SES_WEBHOOK_SECRET`
+5. Set up the SES bounce/complaint webhook (SNS topic, subscription confirmation, SES identity notifications). See [SES Webhook Setup (AWS)](#ses-webhook-setup-aws).
 
 **Lead import size:** Vercel Hobby request bodies are limited to ~4.5 MB. Excel uploads are capped at **4 MB** in multer.
 
@@ -310,6 +311,7 @@ Full interactive docs at `/api/docs`. Summary:
 |---|---|---|
 | `GET` | `/api/admin/mailboxes` | List all mailboxes with `ses_status = pending` across all companies |
 | `PATCH` | `/api/admin/mailboxes/:id/approve` | Verify SES identity, mark mailbox active, activate waiting campaigns |
+| `PATCH` | `/api/admin/mailboxes/:id/resume` | Resume a paused mailbox (e.g. auto-paused for high bounce rate); re-spaces overdue queued emails |
 
 ### Unsubscribe (public — no auth)
 | Method | Path | Description |
@@ -342,14 +344,15 @@ Polls the DB `email_queue` every 30 seconds. When `POST /api/campaigns` is calle
 Polls every 5 minutes (on the **worker** process only). For each mailbox:
 
 1. Connects via IMAP and reads unseen emails from the last 24 hours
-2. Matches the sender email against leads that were previously contacted
-3. Categorizes the reply body using keyword matching (supports English and Bulgarian):
+2. Checks whether the email is a bounce notice (from `mailer-daemon` / `postmaster`, or a delivery status report). Permanent bounces mark the address invalid (see [Bounces](#bounces)); other bounces are skipped
+3. Matches the sender email against leads that were previously contacted
+4. Categorizes the reply body using keyword matching (supports English and Bulgarian):
    - **Positive:** interest, yes, sure, schedule, when, интересувам се, да, удобно, etc.
    - **Negative:** not interested, no thanks, remove, не ме интересува, не благодаря, etc.
    - **Out of office:** vacation, out of office, отсъствам, ваканция, etc.
    - **Neutral:** fallback if no keywords match
-4. Updates `email_logs` with the category
-5. Sets the lead status to `replied` — which stops all future emails to that lead
+5. Updates `email_logs` with the category
+6. Sets the lead status to `replied` — which stops all future emails to that lead
 
 ---
 
@@ -370,14 +373,96 @@ A mailbox can be set to send to friendly contacts first, either when it is added
 
 ### Bounces
 
-If a mailbox's hard bounce rate exceeds **5%** over the last 30 days, it is automatically paused and no further emails are sent from it. Bounces are detected via the SES webhook.
+Invalid addresses are detected in two ways:
+
+- **SES webhook** (`POST /webhooks/ses`): permanent bounces that SES reports via SNS. Setup below.
+- **Inbox bounces** (reply catcher): "address not found" notices that the recipient's mail server sends later from `mailer-daemon` / `postmaster`. SES never sees these, so the worker recognises them in the mailbox inbox.
+
+For a permanent bounce (`5.x.x`), the lead's status becomes `bounced` and no further sequence emails are sent to it. If only the lead's `office_email` bounced, that field is cleared and the primary email keeps receiving the sequence. Temporary failures (`4.x.x`, mailbox full, delayed) are ignored.
+
+If a mailbox's hard bounce rate exceeds **5%** over the last 30 days (at least 10 emails), it is automatically paused:
+
+- No emails are sent from it. Its queued emails stay in the queue (they are not dropped) and go out after it is resumed.
+- The reason and the numbers at that moment are stored on the mailbox (`paused_reason`, `paused_at`, `paused_bounce_rate`, `paused_bounced_count`, `paused_total_count`).
+- Every user of the company sees a red warning at the top of each page with the reason, asking them to contact an administrator. The Mailboxes page shows the reason next to the mailbox.
+
+**Resuming a paused mailbox** is a global-admin action: Admin page → **Paused mailboxes** → **Resume** (or `PATCH /api/admin/mailboxes/:id/resume`). Resuming:
+
+- clears the pause and its reason;
+- sets `bounce_check_since` to now, so the bounce check only counts emails sent after the resume. The old bounces that caused the pause do not pause it again, but new bounces above 5% will;
+- spreads queued emails that became due during the pause over the next send windows (working hours, 3–8 min gaps, daily limit) instead of sending them all at once.
+
+Remove or fix the invalid addresses in the lead lists before resuming.
 
 ### SES Webhook Setup (AWS)
-1. SNS → **Create topic** (Standard) → note the ARN
-2. SES → your verified identity → **Notifications** → assign the SNS topic for **Bounces** and **Complaints**
-3. Add `SES_WEBHOOK_SECRET` to your `.env` / Vercel env
-4. SNS → **Subscriptions** → HTTPS → URL: `https://your-api.vercel.app/webhooks/ses?token=YOUR_SECRET`
-5. The first request is a `SubscriptionConfirmation` — the handler auto-confirms it
+
+Do this once per environment, in the **same region as the SES identities** (`AWS_REGION`).
+
+**1. Create the SNS topic**
+
+SNS → Topics → **Create topic** → Type **Standard**, e.g. `ses-bounce-emails`.
+
+> Do **not** choose **FIFO** (`.fifo`). SES rejects FIFO topics with *"SNS topic … is invalid"*, and FIFO topics cannot deliver to HTTPS endpoints.
+
+**2. Allow SES to publish to the topic**
+
+The topic → **Edit** → **Access policy**. Add this statement to the `Statement` array, replacing the region, account ID and topic name with your own:
+
+```json
+{
+  "Sid": "AllowSESPublish",
+  "Effect": "Allow",
+  "Principal": { "Service": "ses.amazonaws.com" },
+  "Action": "SNS:Publish",
+  "Resource": "arn:aws:sns:<region>:<account-id>:ses-bounce-emails",
+  "Condition": { "StringEquals": { "AWS:SourceAccount": "<account-id>" } }
+}
+```
+
+**3. Deploy the API with the secret**
+
+Set `SES_WEBHOOK_SECRET` in the Vercel env vars and deploy. The webhook must be live before the next step, because SNS sends the confirmation request immediately.
+
+**4. Subscribe the webhook and confirm it**
+
+SNS → Subscriptions → **Create subscription**:
+
+| Field | Value |
+|---|---|
+| Topic ARN | the topic from step 1 |
+| Protocol | **HTTPS** |
+| Endpoint | `https://your-project.vercel.app/webhooks/ses?token=YOUR_SES_WEBHOOK_SECRET` |
+| Enable raw message delivery | **off** (the handler expects the SNS envelope) |
+
+SNS then POSTs a `SubscriptionConfirmation` to the endpoint, and the handler confirms it automatically by calling the `SubscribeURL` from AWS. Within a few seconds the subscription status should change from **Pending confirmation** to **Confirmed**, and the Vercel logs show:
+
+```
+[Webhook] Confirming SNS subscription...
+[Webhook] SNS subscription confirmed — status 200
+```
+
+If it stays **Pending confirmation**:
+
+- Check the Vercel logs for the request. No request at all: the endpoint URL is wrong or not public. `401`: the `token` in the URL does not match `SES_WEBHOOK_SECRET`.
+- Fix the cause, then select the subscription → **Request confirmation** (or delete it and create it again).
+- Opening the webhook URL in a browser returns `{"error":"Route not found"}`. That is expected: the browser sends `GET`, and the route only accepts `POST`. It does not mean the route is missing.
+
+**5. Connect the topic to each SES identity**
+
+SES → Verified identities → the identity → **Notifications** → **Edit**:
+
+- **Bounce feedback** → the topic from step 1
+- **Complaint feedback** → the same topic
+- Leave "Include original email headers" off
+
+Repeat this for every identity that sends campaign emails (each mailbox domain or address).
+
+**6. Test it**
+
+Send a campaign email to `bounce@simulator.amazonses.com`. This SES simulator address always hard-bounces. Within about a minute:
+
+- the Vercel logs show `[Webhook] Hard bounce: bounce@simulator.amazonses.com — 1 lead(s) bounced, …`
+- that lead's status is `bounced`
 
 ---
 

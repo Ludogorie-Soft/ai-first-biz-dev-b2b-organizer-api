@@ -3,11 +3,11 @@
  *
  * Receives AWS SES bounce/complaint notifications delivered via Amazon SNS.
  *
- * Setup in AWS:
- *   1. SNS → Create topic → note the ARN
- *   2. SES → Configuration Sets (or Identity) → Notifications → set the SNS topic for Bounces + Complaints
- *   3. SNS → Subscriptions → subscribe this endpoint URL (https://your-api/webhooks/ses?token=SECRET)
- *   4. The first SNS call will be a SubscriptionConfirmation — this handler auto-confirms it.
+ * Setup in AWS: see "SES Webhook Setup (AWS)" in README.md. In short:
+ *   1. SNS → Create topic, type Standard (SES rejects FIFO topics)
+ *   2. SNS → Subscriptions → HTTPS → https://your-api/webhooks/ses?token=SECRET (raw delivery off)
+ *   3. The first SNS call is a SubscriptionConfirmation — this handler auto-confirms it
+ *   4. SES → Identity → Notifications → set the SNS topic for Bounces + Complaints
  *
  * Security: requests must include ?token=SES_WEBHOOK_SECRET in the URL.
  */
@@ -16,6 +16,7 @@ import { Router, Request, Response } from 'express'
 import https from 'https'
 import { supabaseAdmin } from '../config/supabase'
 import { recordHardBounce } from '../utils/hardBounce'
+import { deletePendingJobsForLeads } from '../queues/dbEmailQueue'
 
 const router = Router()
 
@@ -152,10 +153,12 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     for (const recipient of complaint.complainedRecipients) {
       const email = recipient.emailAddress.toLowerCase()
 
-      await supabaseAdmin
+      const { data: optedOut } = await supabaseAdmin
         .from('leads')
         .update({ status: 'opted_out' })
         .or(`email.eq.${email},office_email.eq.${email}`)
+        .select('id')
+      await deletePendingJobsForLeads(((optedOut ?? []) as { id: string }[]).map((l) => l.id))
 
       console.log(`[Webhook] Complaint (opted out): ${email}`)
     }

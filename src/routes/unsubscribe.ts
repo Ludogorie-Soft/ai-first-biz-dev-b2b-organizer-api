@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
+import { deletePendingJobsForLeads } from '../queues/dbEmailQueue'
 
 const router = Router()
 
@@ -44,15 +45,16 @@ router.post('/', async (req: Request, res: Response, next: NextFunction): Promis
       return
     }
 
-    // Mark every lead record with this email+company as unsubscribed.
-    // The worker already skips leads with status != 'active', so all
-    // pending BullMQ jobs for this address will be silently dropped.
-    await supabaseAdmin
+    // Mark every lead record with this email+company as unsubscribed and
+    // drop their queued emails.
+    const { data: unsubscribed } = await supabaseAdmin
       .from('leads')
       .update({ status: 'unsubscribed' })
       .eq('company_id', record.company_id)
       .eq('email', lead.email)
       .neq('status', 'unsubscribed') // avoid unnecessary writes
+      .select('id')
+    await deletePendingJobsForLeads(((unsubscribed ?? []) as { id: string }[]).map((l) => l.id))
 
     // Persist to suppression list so future imports of this email
     // are immediately marked unsubscribed even after leads are deleted.

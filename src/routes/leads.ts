@@ -6,6 +6,7 @@ import { supabaseAdmin } from '../config/supabase'
 import { authMiddleware } from '../middleware/auth'
 import { enqueueCampaignJobs } from '../utils/enqueueCampaignJobs'
 import { ensureUnsubscribeTokens } from '../utils/unsubscribeTokens'
+import { deletePendingJobsForLeads } from '../queues/dbEmailQueue'
 
 const router = Router()
 router.use(authMiddleware)
@@ -187,6 +188,11 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
     if (error || !data) {
       res.status(404).json({ error: 'Lead not found' })
       return
+    }
+
+    // A lead taken out of the sequence by hand must not keep queued emails
+    if (body.status && body.status !== 'active') {
+      await deletePendingJobsForLeads([(data as { id: string }).id])
     }
 
     // When manually re-activating a lead, remove them from the suppression list

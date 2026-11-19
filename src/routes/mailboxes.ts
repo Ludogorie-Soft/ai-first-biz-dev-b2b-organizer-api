@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { z, ZodError } from 'zod'
 import { supabaseAdmin } from '../config/supabase'
+import { MAILBOX_PAUSE_FIELDS } from '../utils/mailboxPause'
 import { authMiddleware } from '../middleware/auth'
 import { encrypt } from '../utils/encrypt'
 import { sesClient } from '../config/ses'
@@ -27,7 +28,7 @@ const mailboxSchema = z.object({
 })
 
 const MAILBOX_LIST_FIELDS =
-  'id, email, ses_status, is_paused, warmup_started_at, created_at, daily_email_limit, weekly_email_limit, signature, friendly_warmup_pending'
+  `id, email, ses_status, warmup_started_at, created_at, daily_email_limit, weekly_email_limit, signature, friendly_warmup_pending, ${MAILBOX_PAUSE_FIELDS}`
 
 function withWarmupStatus<T extends { warmup_started_at: string | null; daily_email_limit: number }>(mb: T) {
   return { ...mb, ...getWarmupStatus(mb.warmup_started_at, mb.daily_email_limit) }

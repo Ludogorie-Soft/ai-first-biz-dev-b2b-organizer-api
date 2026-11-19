@@ -141,10 +141,12 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
       (lead as { status: string }).status
     )
   ) {
+    // Delete rather than mark sent: nothing was sent, and the queue's
+    // "sent" count should only include emails that actually went out.
     console.log(
-      `[EmailSender] Skipping lead ${leadId} — status: ${(lead as { status: string } | null)?.status}`
+      `[EmailSender] Skipping lead ${leadId} — status: ${(lead as { status: string } | null)?.status} — deleting job ${job.id}`
     )
-    await markJobSent(job.id)
+    await deleteJob(job.id)
     return
   }
 
@@ -178,8 +180,11 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
   if (!mailbox) throw new Error(`Mailbox ${mailboxId} not found`)
 
   if ((mailbox as { is_paused: boolean }).is_paused) {
-    console.warn(`[EmailSender] Mailbox ${mailboxId} is paused — skipping job ${job.id}`)
-    await markJobSent(job.id)
+    // Hold, don't drop: claimJobs skips paused mailboxes, so the job waits
+    // until the mailbox is unpaused. Only hit when the pause happened after
+    // the job was claimed.
+    console.warn(`[EmailSender] Mailbox ${mailboxId} is paused — job ${job.id} held until it is unpaused`)
+    await releaseJob(job.id)
     return
   }
 

@@ -7,6 +7,7 @@ import { GetIdentityVerificationAttributesCommand } from '@aws-sdk/client-ses'
 import { enqueueCampaignJobs } from '../utils/enqueueCampaignJobs'
 import { getWarmupStatus } from '../utils/warmup'
 import { setMailboxWarmup } from '../utils/mailboxWarmup'
+import { MAILBOX_PAUSE_FIELDS, resumeMailbox } from '../utils/mailboxPause'
 
 function getMondayUtcMidnight(): Date {
   const monday = new Date()
@@ -345,7 +346,7 @@ router.get('/mailboxes/limits', async (req: Request, res: Response, next: NextFu
   try {
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .select('id, email, daily_email_limit, weekly_email_limit, warmup_started_at, company:companies(id, name)')
+      .select(`id, email, daily_email_limit, weekly_email_limit, warmup_started_at, ${MAILBOX_PAUSE_FIELDS}, company:companies(id, name)`)
       .order('created_at', { ascending: false })
 
     if (error) {
@@ -385,6 +386,12 @@ router.get('/mailboxes/limits', async (req: Request, res: Response, next: NextFu
           ...getWarmupStatus(mb.warmup_started_at, mb.daily_email_limit),
           sent_today: sentToday ?? 0,
           sent_this_week: sentThisWeek ?? 0,
+          is_paused: mb.is_paused,
+          paused_reason: mb.paused_reason,
+          paused_at: mb.paused_at,
+          paused_bounce_rate: mb.paused_bounce_rate,
+          paused_bounced_count: mb.paused_bounced_count,
+          paused_total_count: mb.paused_total_count,
         }
       })
     )
@@ -521,6 +528,47 @@ router.patch('/mailboxes/:id/warmup', async (req: Request, res: Response, next: 
       ...getWarmupStatus(data!.warmup_started_at, data!.daily_email_limit),
       rescheduled_jobs: rescheduledJobs,
     })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /admin/mailboxes/{id}/resume:
+ *   patch:
+ *     summary: Resume a paused mailbox, e.g. one auto-paused for a high bounce rate (global admin only)
+ *     description: >
+ *       Clears the pause and its reason. The bounce-rate check then only counts emails sent
+ *       from now on. Queued emails that became due while paused are spread over the send window.
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: "{ id, is_paused: false, rescheduled_jobs }"
+ *       404:
+ *         description: Mailbox not found
+ */
+router.patch('/mailboxes/:id/resume', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid mailbox ID' })
+    return
+  }
+  try {
+    const result = await resumeMailbox(req.params.id as string)
+    if (!result) {
+      res.status(404).json({ error: 'Mailbox not found' })
+      return
+    }
+    console.log(
+      `[Admin] Mailbox ${req.params.id} resumed by ${req.user.email ?? req.user.id} — ${result.rescheduled_jobs} queued email(s) re-spaced`
+    )
+    res.json({ id: req.params.id, is_paused: false, ...result })
   } catch (err) {
     next(err)
   }

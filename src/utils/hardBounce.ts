@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../config/supabase'
 import { HARD_BOUNCE_THRESHOLD } from './warmup'
+import { deletePendingJobsForLeads } from '../queues/dbEmailQueue'
 
 export interface HardBounceResult {
   /** Leads whose primary email bounced: now status 'bounced', no further sequence emails. */
@@ -10,16 +11,39 @@ export interface HardBounceResult {
   campaignIds: string[]
 }
 
-/** Pauses the mailbox when its hard-bounce rate over the last 30 days exceeds the threshold. */
+export const BOUNCE_WINDOW_DAYS = 30
+export const PAUSED_REASON_HIGH_BOUNCE_RATE = 'high_bounce_rate'
+
+/**
+ * Pauses the mailbox when its hard-bounce rate over the last 30 days exceeds
+ * the threshold, recording the reason and numbers for the UI.
+ *
+ * Only emails sent after bounce_check_since count: when an admin resumes a
+ * mailbox, the bounces that caused the pause do not pause it again.
+ * An already paused mailbox is left as it is.
+ */
 export async function checkAndPauseIfNeeded(mailboxId: string): Promise<void> {
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
+  const { data: mailbox } = await supabaseAdmin
+    .from('mailboxes')
+    .select('is_paused, bounce_check_since')
+    .eq('id', mailboxId)
+    .maybeSingle()
+  if (!mailbox) return
+  const mb = mailbox as { is_paused: boolean; bounce_check_since: string | null }
+  if (mb.is_paused) return
+
+  const windowStart = new Date(Date.now() - BOUNCE_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+  const since =
+    mb.bounce_check_since && new Date(mb.bounce_check_since) > windowStart
+      ? new Date(mb.bounce_check_since)
+      : windowStart
 
   const { data: logs } = await supabaseAdmin
     .from('email_logs')
     .select('status')
     .eq('mailbox_id', mailboxId)
     .in('status', ['sent', 'bounced'])
-    .gte('created_at', thirtyDaysAgo)
+    .gte('created_at', since.toISOString())
 
   if (!logs || logs.length < 10) return // not enough data yet
 
@@ -27,9 +51,20 @@ export async function checkAndPauseIfNeeded(mailboxId: string): Promise<void> {
   const rate = bounced / logs.length
 
   if (rate > HARD_BOUNCE_THRESHOLD) {
-    await supabaseAdmin.from('mailboxes').update({ is_paused: true }).eq('id', mailboxId)
+    await supabaseAdmin
+      .from('mailboxes')
+      .update({
+        is_paused: true,
+        paused_reason: PAUSED_REASON_HIGH_BOUNCE_RATE,
+        paused_at: new Date().toISOString(),
+        paused_bounce_rate: Number(rate.toFixed(4)),
+        paused_bounced_count: bounced,
+        paused_total_count: logs.length,
+      })
+      .eq('id', mailboxId)
+      .eq('is_paused', false)
     console.warn(
-      `[Bounce] Mailbox ${mailboxId} paused — hard bounce rate ${(rate * 100).toFixed(1)}% exceeds ${HARD_BOUNCE_THRESHOLD * 100}% threshold`
+      `[Bounce] Mailbox ${mailboxId} paused — hard bounce rate ${(rate * 100).toFixed(1)}% (${bounced}/${logs.length}) exceeds ${HARD_BOUNCE_THRESHOLD * 100}% threshold`
     )
   }
 }
@@ -114,6 +149,7 @@ export async function recordHardBounce(
   result.bouncedLeadIds = bounced.map((l) => l.id)
   for (const l of bounced) if (l.campaign_id) campaignIds.add(l.campaign_id)
   for (const id of await markLogsBounced(result.bouncedLeadIds, email, true)) mailboxIds.add(id)
+  await deletePendingJobsForLeads(result.bouncedLeadIds)
 
   // Office email
   let officeQuery = supabaseAdmin

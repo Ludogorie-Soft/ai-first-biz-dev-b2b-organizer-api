@@ -6,6 +6,7 @@ import { categorizeReply } from '../utils/categorizeReply'
 import { checkAndCompleteCampaign } from '../utils/campaignCompletion'
 import { detectBounce, BounceInfo } from '../utils/detectBounce'
 import { recordHardBounce } from '../utils/hardBounce'
+import { deletePendingJobsForLeads } from '../queues/dbEmailQueue'
 import { Mailbox, EncryptedPayload } from '../types'
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
@@ -157,6 +158,7 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
             .from('leads')
             .update({ status: 'replied' })
             .eq('id', log.lead_id)
+          await deletePendingJobsForLeads([log.lead_id])
 
           campaignIdsTouched.add(log.campaign_id)
         }
