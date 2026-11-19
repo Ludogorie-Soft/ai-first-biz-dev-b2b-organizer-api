@@ -5,7 +5,8 @@ import { authMiddleware } from '../middleware/auth'
 import { encrypt } from '../utils/encrypt'
 import { sesClient } from '../config/ses'
 import { SendEmailCommand } from '@aws-sdk/client-ses'
-import { getDailyLimit } from '../utils/warmup'
+import { getWarmupStatus } from '../utils/warmup'
+import { setMailboxWarmup } from '../utils/mailboxWarmup'
 import { sanitizeEmailBody } from '../utils/emailHtml'
 
 const router = Router()
@@ -27,6 +28,10 @@ const mailboxSchema = z.object({
 
 const MAILBOX_LIST_FIELDS =
   'id, email, ses_status, is_paused, warmup_started_at, created_at, daily_email_limit, weekly_email_limit, signature, friendly_warmup_pending'
+
+function withWarmupStatus<T extends { warmup_started_at: string | null; daily_email_limit: number }>(mb: T) {
+  return { ...mb, ...getWarmupStatus(mb.warmup_started_at, mb.daily_email_limit) }
+}
 
 /**
  * @swagger
@@ -51,19 +56,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
       return
     }
 
-    const result = (data ?? []).map((mb: any) => {
-      const effectiveDailyLimit = getDailyLimit(
-        mb.warmup_started_at ? new Date(mb.warmup_started_at) : null,
-        mb.daily_email_limit
-      )
-      return {
-        ...mb,
-        effective_daily_limit: effectiveDailyLimit,
-        is_warming_up: effectiveDailyLimit < mb.daily_email_limit,
-      }
-    })
-
-    res.json(result)
+    res.json((data ?? []).map(withWarmupStatus))
   } catch (err) {
     next(err)
   }
@@ -189,7 +182,10 @@ async function notifyAdminsNewMailbox(mailboxEmail: string, companyId: string): 
  * @swagger
  * /mailboxes/{id}:
  *   patch:
- *     summary: Update mailbox signature or friendly-contacts warmup
+ *     summary: Update mailbox signature, friendly-contacts warmup or warmup ramp
+ *     description: |
+ *       Any company user may set warmed_up. signature and friendly_warmup_pending
+ *       require the owner or admin role.
  *     tags: [Mailboxes]
  *     security: [{ bearerAuth: [] }]
  *     parameters:
@@ -206,6 +202,9 @@ async function notifyAdminsNewMailbox(mailboxEmail: string, companyId: string): 
  *             properties:
  *               signature: { type: string, nullable: true }
  *               friendly_warmup_pending: { type: boolean }
+ *               warmed_up:
+ *                 type: boolean
+ *                 description: true = mailbox already has a sending history, use the configured daily limit now; false = restart the warmup ramp from today
  *     responses:
  *       200:
  *         description: Updated mailbox
@@ -219,18 +218,36 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
     res.status(400).json({ error: 'Invalid mailbox ID' })
     return
   }
-  if (!['owner', 'admin', 'global_admin'].includes(req.user.role)) {
-    res.status(403).json({ error: 'Only owners and admins can update mailboxes' })
-    return
-  }
   try {
     const schema = z
       .object({
         signature: z.string().nullable().optional(),
         friendly_warmup_pending: z.boolean().optional(),
+        warmed_up: z.boolean().optional(),
       })
       .refine((d) => Object.keys(d).length > 0, { message: 'At least one field required' })
     const parsed = schema.parse(req.body)
+
+    // Every company user may mark a mailbox as warmed up; other settings need owner/admin
+    const needsAdmin = parsed.signature !== undefined || parsed.friendly_warmup_pending !== undefined
+    if (needsAdmin && !['owner', 'admin', 'global_admin'].includes(req.user.role)) {
+      res.status(403).json({ error: 'Only owners and admins can update mailboxes' })
+      return
+    }
+
+    if (parsed.warmed_up !== undefined) {
+      const { data: owned } = await supabaseAdmin
+        .from('mailboxes')
+        .select('id')
+        .eq('id', req.params.id)
+        .eq('company_id', req.user.company_id)
+        .maybeSingle()
+      if (!owned) {
+        res.status(404).json({ error: 'Mailbox not found' })
+        return
+      }
+      await setMailboxWarmup(req.params.id as string, parsed.warmed_up)
+    }
 
     const updates: { signature?: string | null; friendly_warmup_pending?: boolean } = {}
     if (parsed.friendly_warmup_pending !== undefined) {
@@ -245,18 +262,26 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction): Pr
       }
     }
 
-    const { data, error } = await supabaseAdmin
-      .from('mailboxes')
-      .update(updates)
-      .eq('id', req.params.id)
-      .eq('company_id', req.user.company_id)
-      .select(MAILBOX_LIST_FIELDS)
-      .single()
+    // warmed_up alone has already been written above — just return the fresh row
+    const { data, error } = Object.keys(updates).length > 0
+      ? await supabaseAdmin
+          .from('mailboxes')
+          .update(updates)
+          .eq('id', req.params.id)
+          .eq('company_id', req.user.company_id)
+          .select(MAILBOX_LIST_FIELDS)
+          .single()
+      : await supabaseAdmin
+          .from('mailboxes')
+          .select(MAILBOX_LIST_FIELDS)
+          .eq('id', req.params.id)
+          .eq('company_id', req.user.company_id)
+          .single()
     if (error || !data) {
       res.status(404).json({ error: 'Mailbox not found' })
       return
     }
-    res.json(data)
+    res.json(withWarmupStatus(data))
   } catch (err) {
     if (err instanceof ZodError) {
       res.status(400).json({ error: err.errors })

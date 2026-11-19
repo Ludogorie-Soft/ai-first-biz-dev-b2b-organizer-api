@@ -15,6 +15,8 @@ import {
   claimJobs,
   markJobSent,
   rescheduleJob,
+  releaseJob,
+  deleteJob,
   failJobWithRetry,
   enqueueJob,
   resetStuckJobs,
@@ -107,6 +109,25 @@ async function processEmailJob(job: EmailQueueRow): Promise<void> {
   const leadId        = job.lead_id
   const mailboxId     = job.mailbox_id
   const sendOnWeekends = job.send_on_weekends
+
+  // Campaign must still exist and be active. claimJobs already filters on this;
+  // re-check here in case the campaign was paused/deleted after the job was claimed.
+  const { data: campaign } = await supabaseAdmin
+    .from('campaigns')
+    .select('status')
+    .eq('id', campaignId)
+    .maybeSingle()
+  if (!campaign) {
+    console.log(`[EmailSender] Campaign ${campaignId} no longer exists — deleting job ${job.id}`)
+    await deleteJob(job.id)
+    return
+  }
+  const campaignStatus = (campaign as { status: string }).status
+  if (campaignStatus !== 'active') {
+    console.log(`[EmailSender] Campaign ${campaignId} is ${campaignStatus} — job ${job.id} held until it is active`)
+    await releaseJob(job.id)
+    return
+  }
 
   // Fetch lead — check if still eligible to receive emails
   const { data: lead } = await supabaseAdmin

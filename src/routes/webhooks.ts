@@ -15,7 +15,7 @@
 import { Router, Request, Response } from 'express'
 import https from 'https'
 import { supabaseAdmin } from '../config/supabase'
-import { HARD_BOUNCE_THRESHOLD } from '../utils/warmup'
+import { recordHardBounce } from '../utils/hardBounce'
 
 const router = Router()
 
@@ -53,36 +53,6 @@ interface SesComplaintNotification {
   mail: { destination: string[] }
 }
 
-// ── Helper: check if bounce rate exceeds threshold and pause mailbox ───────
-
-async function checkAndPauseIfNeeded(mailboxId: string): Promise<void> {
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
-
-  const { data: logs } = await supabaseAdmin
-    .from('email_logs')
-    .select('status')
-    .eq('mailbox_id', mailboxId)
-    .in('status', ['sent', 'bounced'])
-    .gte('created_at', thirtyDaysAgo)
-
-  if (!logs || logs.length < 10) return  // not enough data yet
-
-  const total   = logs.length
-  const bounced = logs.filter((l: { status: string }) => l.status === 'bounced').length
-  const rate    = bounced / total
-
-  if (rate > HARD_BOUNCE_THRESHOLD) {
-    await supabaseAdmin
-      .from('mailboxes')
-      .update({ is_paused: true })
-      .eq('id', mailboxId)
-
-    console.warn(
-      `[Webhook] Mailbox ${mailboxId} paused — hard bounce rate ${(rate * 100).toFixed(1)}% exceeds ${HARD_BOUNCE_THRESHOLD * 100}% threshold`
-    )
-  }
-}
-
 // ── Route ──────────────────────────────────────────────────────────────────
 
 router.post('/', async (req: Request, res: Response): Promise<void> => {
@@ -103,13 +73,41 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     return
   }
 
-  // Auto-confirm SNS subscription
+  // Auto-confirm SNS subscription. Awaited before responding: on serverless
+  // (Vercel) the function is frozen once the response is sent, so a
+  // fire-and-forget request would never reach AWS.
   if (envelope.Type === 'SubscriptionConfirmation' && envelope.SubscribeURL) {
+    const subscribeUrl = envelope.SubscribeURL
+    let host: string
+    try {
+      host = new URL(subscribeUrl).hostname
+    } catch {
+      res.status(400).json({ error: 'Invalid SubscribeURL' })
+      return
+    }
+    // Only follow confirmation links that point at AWS SNS
+    if (!/^sns\.[a-z0-9-]+\.amazonaws\.com$/.test(host)) {
+      console.warn(`[Webhook] Rejected SubscribeURL with unexpected host: ${host}`)
+      res.status(400).json({ error: 'Invalid SubscribeURL' })
+      return
+    }
+
     console.log('[Webhook] Confirming SNS subscription...')
-    https.get(envelope.SubscribeURL, (r) => {
-      console.log(`[Webhook] SNS subscription confirmed — status ${r.statusCode}`)
-    }).on('error', (e) => console.error('[Webhook] SNS confirmation error:', e.message))
-    res.status(200).send('OK')
+    try {
+      const status = await new Promise<number | undefined>((resolve, reject) => {
+        https
+          .get(subscribeUrl, (r) => {
+            r.resume() // drain the body so the request completes
+            r.on('end', () => resolve(r.statusCode))
+          })
+          .on('error', reject)
+      })
+      console.log(`[Webhook] SNS subscription confirmed — status ${status}`)
+      res.status(200).send('OK')
+    } catch (e) {
+      console.error('[Webhook] SNS confirmation error:', (e as Error).message)
+      res.status(500).json({ error: 'Subscription confirmation failed' })
+    }
     return
   }
 
@@ -135,38 +133,15 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
 
     for (const recipient of bounce.bouncedRecipients) {
       const email = recipient.emailAddress.toLowerCase()
-
-      // Mark lead as bounced (match both personal and office email fields)
-      const { data: leads } = await supabaseAdmin
-        .from('leads')
-        .update({ status: 'bounced' })
-        .or(`email.eq.${email},office_email.eq.${email}`)
-        .select('id, company_id')
-
-      // Update the most recent email_log for this lead to bounced
-      if (leads && leads.length > 0) {
-        for (const lead of leads as Array<{ id: string; company_id: string }>) {
-          const { data: log } = await supabaseAdmin
-            .from('email_logs')
-            .select('id, mailbox_id')
-            .eq('lead_id', lead.id)
-            .eq('status', 'sent')
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .single()
-
-          if (log) {
-            await supabaseAdmin
-              .from('email_logs')
-              .update({ status: 'bounced' })
-              .eq('id', (log as { id: string }).id)
-
-            await checkAndPauseIfNeeded((log as { id: string; mailbox_id: string }).mailbox_id)
-          }
-        }
+      try {
+        const result = await recordHardBounce(email)
+        console.log(
+          `[Webhook] Hard bounce: ${email} — ${result.bouncedLeadIds.length} lead(s) bounced, ` +
+          `${result.clearedOfficeLeadIds.length} office email(s) cleared`
+        )
+      } catch (err) {
+        console.error(`[Webhook] Failed to record hard bounce for ${email}:`, (err as Error).message)
       }
-
-      console.log(`[Webhook] Hard bounce: ${email}`)
     }
   }
 

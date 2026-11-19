@@ -4,9 +4,67 @@ import { supabaseAdmin } from '../config/supabase'
 import { decrypt } from '../utils/encrypt'
 import { categorizeReply } from '../utils/categorizeReply'
 import { checkAndCompleteCampaign } from '../utils/campaignCompletion'
+import { detectBounce, BounceInfo } from '../utils/detectBounce'
+import { recordHardBounce } from '../utils/hardBounce'
 import { Mailbox, EncryptedPayload } from '../types'
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
+
+/**
+ * Handles a bounce found in the inbox ("address not found" from the recipient's
+ * mail server). Permanent bounces mark the address invalid so the rest of the
+ * sequence is not sent to it; temporary ones (mailbox full, delayed) are ignored.
+ * Safe to run on the same message again: recordHardBounce is idempotent.
+ */
+async function handleInboxBounce(bounce: BounceInfo, mailbox: Mailbox, subject: string): Promise<void> {
+  if (!bounce.permanent) {
+    console.log(`[ReplyCatcher] Temporary bounce ignored in mailbox ${mailbox.id}: "${subject}"`)
+    return
+  }
+
+  const ownAddress = mailbox.email.toLowerCase()
+  let addresses = bounce.recipients.filter((a) => a !== ownAddress)
+
+  // Plain-text bounce without machine-readable recipients: keep only addresses
+  // that belong to this company's leads.
+  if (addresses.length === 0 && bounce.mentionedAddresses.length > 0) {
+    const candidates = bounce.mentionedAddresses.filter((a) => a !== ownAddress)
+    if (candidates.length > 0) {
+      const [{ data: byEmail }, { data: byOffice }] = await Promise.all([
+        supabaseAdmin.from('leads').select('email').eq('company_id', mailbox.company_id).in('email', candidates),
+        supabaseAdmin
+          .from('leads')
+          .select('office_email')
+          .eq('company_id', mailbox.company_id)
+          .in('office_email', candidates),
+      ])
+      addresses = [
+        ...new Set([
+          ...((byEmail ?? []) as { email: string }[]).map((l) => l.email),
+          ...((byOffice ?? []) as { office_email: string }[]).map((l) => l.office_email),
+        ]),
+      ]
+    }
+  }
+
+  if (addresses.length === 0) {
+    console.log(`[ReplyCatcher] Bounce in mailbox ${mailbox.id} matches no lead: "${subject}"`)
+    return
+  }
+
+  const campaignIds = new Set<string>()
+  for (const address of addresses) {
+    const result = await recordHardBounce(address, { companyId: mailbox.company_id })
+    result.campaignIds.forEach((id) => campaignIds.add(id))
+    if (result.bouncedLeadIds.length > 0 || result.clearedOfficeLeadIds.length > 0) {
+      console.log(
+        `[ReplyCatcher] Hard bounce: ${address} — ${result.bouncedLeadIds.length} lead(s) bounced, ` +
+          `${result.clearedOfficeLeadIds.length} office email(s) cleared`
+      )
+    }
+  }
+  for (const cid of campaignIds) await checkAndCompleteCampaign(cid)
+}
 
 async function processMailbox(mailbox: Mailbox): Promise<void> {
   if (!mailbox.imap_config) return
@@ -42,6 +100,13 @@ async function processMailbox(mailbox: Mailbox): Promise<void> {
       try {
         if (!msg.source) continue
         const parsed: ParsedMail = await simpleParser(msg.source)
+
+        const bounce = detectBounce(parsed)
+        if (bounce) {
+          await handleInboxBounce(bounce, mailbox, parsed.subject ?? '')
+          continue
+        }
+
         const senderEmail = parsed.from?.value?.[0]?.address?.toLowerCase()
         if (!senderEmail) continue
 

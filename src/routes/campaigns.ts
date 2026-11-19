@@ -10,6 +10,7 @@ import {
   releaseFriendlyWarmup,
 } from '../utils/friendlyWarmup'
 import { SEQUENCE_HAS_NO_STEPS, findSequencesWithoutSteps } from '../utils/sequenceSteps'
+import { deleteCampaignJobs } from '../queues/dbEmailQueue'
 
 const router = Router()
 router.use(authMiddleware)
@@ -398,6 +399,9 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction): P
       res.status(400).json({ error: 'Only paused or draft campaigns can be deleted' })
       return
     }
+
+    // Remove queued emails first so nothing is sent for a deleted campaign
+    await deleteCampaignJobs(req.params.id as string)
 
     const { error } = await supabaseAdmin
       .from('campaigns')

@@ -187,12 +187,46 @@ function randomGapMs(): number {
  */
 export function getDailyLimit(warmupStartedAt: Date | null, maxLimit = HARD_CAP): number {
   if (!warmupStartedAt) return Math.min(8, maxLimit)
-  const daysSince = Math.floor(
-    (Date.now() - warmupStartedAt.getTime()) / (1000 * 60 * 60 * 24)
-  )
-  if (daysSince >= 21) return maxLimit
+  const daysSince = Math.floor((Date.now() - warmupStartedAt.getTime()) / DAY_MS)
+  if (daysSince >= WARMUP_DAYS) return maxLimit
   if (daysSince >= 7)  return Math.min(12, maxLimit)
   return Math.min(8, maxLimit)
+}
+
+/** Days after warmup_started_at when a mailbox sends at its full configured limit. */
+export const WARMUP_DAYS = 21
+const DAY_MS = 24 * 60 * 60 * 1000
+
+export interface WarmupStatus {
+  /** Limit the sender enforces today (warmup ramp capped by the configured limit) */
+  effective_daily_limit: number
+  /** True until WARMUP_DAYS have passed since warmup_started_at */
+  is_warming_up: boolean
+  /** When the mailbox reaches its full configured limit; null once warmed up */
+  warmup_ends_at: string | null
+}
+
+export function getWarmupStatus(
+  warmupStartedAt: string | Date | null,
+  maxLimit: number,
+  now: Date = new Date()
+): WarmupStatus {
+  const start = warmupStartedAt ? new Date(warmupStartedAt) : now
+  const endsAt = new Date(start.getTime() + WARMUP_DAYS * DAY_MS)
+  const isWarmingUp = endsAt.getTime() > now.getTime()
+  return {
+    effective_daily_limit: getDailyLimit(warmupStartedAt ? start : null, maxLimit),
+    is_warming_up: isWarmingUp,
+    warmup_ends_at: isWarmingUp ? endsAt.toISOString() : null,
+  }
+}
+
+/**
+ * warmup_started_at value that makes a mailbox count as fully warmed up — used when
+ * a mailbox with an existing sending history is marked as "already warmed up".
+ */
+export function warmedUpStartDate(now: Date = new Date()): Date {
+  return new Date(now.getTime() - WARMUP_DAYS * DAY_MS)
 }
 
 /**

@@ -58,16 +58,54 @@ export async function enqueueJob(
 }
 
 /**
- * Atomically claim up to batchSize pending jobs that are due.
- * Calls the claim_email_jobs Postgres function which uses FOR UPDATE SKIP LOCKED
- * so concurrent workers never double-claim a row.
+ * Claim up to batchSize due, pending jobs that belong to ACTIVE campaigns.
+ *
+ * Jobs of paused / completed / deleted campaigns are never selected, so they stay
+ * 'pending' with their original scheduled_at and resume when the campaign is
+ * set back to active (and can't block other campaigns' jobs meanwhile).
+ *
+ * Two steps:
+ *   1. Select candidate job ids (due, pending, campaign active).
+ *   2. Flip them to 'processing' with a conditional UPDATE ... WHERE status = 'pending'.
+ *      Postgres re-checks the WHERE clause under the row lock, so if another worker
+ *      claimed a row first it is simply not returned here — no double claims.
+ *      The cost of a race is only a smaller batch for the losing worker.
  */
 export async function claimJobs(batchSize = 5): Promise<EmailQueueRow[]> {
-  const { data, error } = await supabaseAdmin.rpc('claim_email_jobs', {
-    batch_limit: batchSize,
-  })
-  if (error) throw new Error(`[DB Queue] claimJobs failed: ${error.message}`)
-  return (data ?? []) as EmailQueueRow[]
+  const nowIso = new Date().toISOString()
+
+  // email_queue has no FK to campaigns, so PostgREST can't join — fetch active ids first.
+  const { data: activeCampaigns, error: campaignsError } = await supabaseAdmin
+    .from('campaigns')
+    .select('id')
+    .eq('status', 'active')
+  if (campaignsError) throw new Error(`[DB Queue] claimJobs failed to load campaigns: ${campaignsError.message}`)
+
+  const activeIds = (activeCampaigns ?? []).map((c: { id: string }) => c.id)
+  if (activeIds.length === 0) return []
+
+  const { data: candidates, error: selectError } = await supabaseAdmin
+    .from('email_queue')
+    .select('id')
+    .eq('status', 'pending')
+    .lte('scheduled_at', nowIso)
+    .in('campaign_id', activeIds)
+    .order('scheduled_at')
+    .limit(batchSize)
+  if (selectError) throw new Error(`[DB Queue] claimJobs failed to select: ${selectError.message}`)
+
+  const candidateIds = (candidates ?? []).map((r: { id: string }) => r.id)
+  if (candidateIds.length === 0) return []
+
+  const { data: claimed, error: updateError } = await supabaseAdmin
+    .from('email_queue')
+    .update({ status: 'processing', updated_at: nowIso })
+    .in('id', candidateIds)
+    .eq('status', 'pending')
+    .select('*')
+  if (updateError) throw new Error(`[DB Queue] claimJobs failed to claim: ${updateError.message}`)
+
+  return (claimed ?? []) as EmailQueueRow[]
 }
 
 /**
@@ -93,6 +131,33 @@ export async function rescheduleJob(id: string, delayMs: number): Promise<void> 
       updated_at: new Date().toISOString(),
     })
     .eq('id', id)
+}
+
+/**
+ * Return a claimed job to 'pending' without touching scheduled_at or attempts.
+ * Used when the campaign is no longer active: claimJobs skips jobs of
+ * non-active campaigns, so the job waits until the campaign is resumed.
+ */
+export async function releaseJob(id: string): Promise<void> {
+  await supabaseAdmin
+    .from('email_queue')
+    .update({ status: 'pending', updated_at: new Date().toISOString() })
+    .eq('id', id)
+}
+
+/**
+ * Delete a job outright (e.g. its campaign no longer exists).
+ */
+export async function deleteJob(id: string): Promise<void> {
+  await supabaseAdmin.from('email_queue').delete().eq('id', id)
+}
+
+/**
+ * Delete all queued jobs of a campaign.
+ */
+export async function deleteCampaignJobs(campaignId: string): Promise<void> {
+  const { error } = await supabaseAdmin.from('email_queue').delete().eq('campaign_id', campaignId)
+  if (error) throw new Error(`[DB Queue] deleteCampaignJobs failed: ${error.message}`)
 }
 
 /**

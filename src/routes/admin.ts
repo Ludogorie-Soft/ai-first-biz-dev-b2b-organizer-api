@@ -5,6 +5,8 @@ import { authMiddleware } from '../middleware/auth'
 import { sesClient } from '../config/ses'
 import { GetIdentityVerificationAttributesCommand } from '@aws-sdk/client-ses'
 import { enqueueCampaignJobs } from '../utils/enqueueCampaignJobs'
+import { getWarmupStatus } from '../utils/warmup'
+import { setMailboxWarmup } from '../utils/mailboxWarmup'
 
 function getMondayUtcMidnight(): Date {
   const monday = new Date()
@@ -332,7 +334,7 @@ const mailboxLimitsSchema = z
  * @swagger
  * /admin/mailboxes/limits:
  *   get:
- *     summary: List all mailboxes with their email limits and current usage (global admin only)
+ *     summary: List all mailboxes with their email limits, warmup state and current usage (global admin only)
  *     tags: [Admin]
  *     security: [{ bearerAuth: [] }]
  *     responses:
@@ -343,7 +345,7 @@ router.get('/mailboxes/limits', async (req: Request, res: Response, next: NextFu
   try {
     const { data, error } = await supabaseAdmin
       .from('mailboxes')
-      .select('id, email, daily_email_limit, weekly_email_limit, company:companies(id, name)')
+      .select('id, email, daily_email_limit, weekly_email_limit, warmup_started_at, company:companies(id, name)')
       .order('created_at', { ascending: false })
 
     if (error) {
@@ -379,6 +381,8 @@ router.get('/mailboxes/limits', async (req: Request, res: Response, next: NextFu
           company_name: (mb.company as { name: string } | null)?.name,
           daily_email_limit: mb.daily_email_limit,
           weekly_email_limit: mb.weekly_email_limit,
+          warmup_started_at: mb.warmup_started_at,
+          ...getWarmupStatus(mb.warmup_started_at, mb.daily_email_limit),
           sent_today: sentToday ?? 0,
           sent_this_week: sentThisWeek ?? 0,
         }
@@ -450,6 +454,73 @@ router.patch('/mailboxes/:id/limits', async (req: Request, res: Response, next: 
     }
 
     res.json(data)
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * @swagger
+ * /admin/mailboxes/{id}/warmup:
+ *   patch:
+ *     summary: Mark a mailbox as already warmed up, or restart its warmup ramp (global admin only)
+ *     tags: [Admin]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [warmed_up]
+ *             properties:
+ *               warmed_up: { type: boolean }
+ *     responses:
+ *       200:
+ *         description: Updated warmup state and number of queued emails moved earlier
+ *       404:
+ *         description: Mailbox not found
+ */
+router.patch('/mailboxes/:id/warmup', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    res.status(400).json({ error: 'Invalid mailbox ID' })
+    return
+  }
+  const parsed = z.object({ warmed_up: z.boolean() }).safeParse(req.body)
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.errors })
+    return
+  }
+
+  try {
+    const { data: existing } = await supabaseAdmin
+      .from('mailboxes')
+      .select('id')
+      .eq('id', req.params.id)
+      .maybeSingle()
+    if (!existing) {
+      res.status(404).json({ error: 'Mailbox not found' })
+      return
+    }
+
+    const rescheduledJobs = await setMailboxWarmup(req.params.id as string, parsed.data.warmed_up)
+
+    const { data } = await supabaseAdmin
+      .from('mailboxes')
+      .select('id, email, daily_email_limit, weekly_email_limit, warmup_started_at')
+      .eq('id', req.params.id)
+      .single()
+
+    res.json({
+      ...data,
+      ...getWarmupStatus(data!.warmup_started_at, data!.daily_email_limit),
+      rescheduled_jobs: rescheduledJobs,
+    })
   } catch (err) {
     next(err)
   }
